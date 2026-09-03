@@ -1,0 +1,9 @@
+build/
+.cache/
+*.idx
+compile_commands.json
+build-small
+build
+models/
+.kiro/hooks/
+.vscode/

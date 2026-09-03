@@ -1,0 +1,13 @@
+-I
+./src/
+-I
+./vendor/include/
+-I
+./vendor/llama.cpp/include/
+-I
+./vendor/llama.cpp/common/
+-I
+./vendor/CLI11/
+-I
+./vendor/tree-sitter/lib/include/
+-std=c++20

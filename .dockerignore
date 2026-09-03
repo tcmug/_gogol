@@ -1,0 +1,16 @@
+# Local build artifacts — must not leak into the image (a host CMakeCache.txt
+# has absolute host paths and makes the in-container cmake configure fail).
+build/
+cmake-build-*/
+
+# VCS + editor cruft
+.git/
+.gitmodules.bak
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local runtime/state
+*.premigrate
+RESUME
