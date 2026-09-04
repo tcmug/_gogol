@@ -79,13 +79,13 @@ std::vector<ToolDef> build_registry() {
         "Retrieve an entry's content by exact location. Use after query/list "
         "finds the right entry. A doc path may carry a `:line` suffix; `lines` "
         "limits how many lines are returned. Alternatively pass `result` (a "
-        "0-based index into the last query/calls result set) to retrieve a hit "
-        "without re-specifying type/index/path.",
+        "0-based index into the last query/calls/explore result set) to retrieve "
+        "a hit without re-specifying type/index/path.",
         {
             {"type", "string", "Entry type: doc | note | term. Omit when using `result`.", false, ""},
             {"index", "string", "Index the entry lives in. Omit to use the session default or a `result` cursor.", false, ""},
             {"path", "string", "Entry path (doc may include a :line suffix). Omit when using `result`.", false, ""},
-            {"result", "integer", "0-based index into the last query/calls result set. Resolves type/index/path from the cache.", false, ""},
+            {"result", "integer", "0-based index into the last query/calls/explore result set. Resolves type/index/path from the cache. After explore, result 0 is the definition, then callers, callees, related.", false, ""},
             {"lines", "integer", "Max lines to return (0 = full).", false, "0"},
         },
         /*read_only=*/true,

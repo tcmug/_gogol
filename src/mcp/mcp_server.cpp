@@ -195,7 +195,11 @@ ToolResult handle_get(const ToolArgs& a, Session& s) {
     }
 
     if (type_tok.empty())
-        return ToolResult::fail("missing required parameter: type (or a `result` cursor)");
+        return ToolResult::fail(
+            "get needs a location: pass type+index+path, or `result: N` (a "
+            "0-based index into the last query/calls/explore results). "
+            "Each query/explore hit already carries type/index/path — pass "
+            "those, or `result: 0` for the first hit.");
     if (index.empty())
         return ToolResult::fail("missing required parameter: index (or a `result` cursor)");
     if (path.empty())
@@ -726,6 +730,60 @@ ToolResult handle_explore(const ToolArgs& a, Session& s) {
         }
     }
     out["related"] = std::move(related);
+
+    // Cache a flat, get-compatible cursor list so a follow-up `get {result:N}`
+    // resolves a location without re-typing it — same contract as query/calls.
+    // Order: the definition itself (result 0), then callers, callees, related.
+    // Every cursor is {type:"doc", index, path:<file>, line, name?} so get can
+    // resolve it directly.
+    {
+        Json cursors = Json::array();
+        auto push_cursor = [&](const std::string& ix, const std::string& file,
+                               long line, const std::string& nm) {
+            if (file.empty()) return;
+            Json c = Json::object();
+            c["type"] = "doc";
+            c["index"] = ix;
+            c["path"] = file;
+            if (line > 0) c["line"] = line;
+            if (!nm.empty()) c["name"] = nm;
+            cursors.push_back(std::move(c));
+        };
+        // Definition first (result 0).
+        push_cursor(def.index, def.file, def.line, name);
+        // Then callers, callees, related — reuse the arrays already built.
+        auto push_edges = [&](const Json& edges) {
+            if (!edges.is_array()) return;
+            for (const auto& e : edges) {
+                if (!e.is_object()) continue;
+                auto gs = [&](const char* k) {
+                    auto it = e.find(k);
+                    return (it != e.end() && it->is_string()) ? it->get<std::string>() : std::string();
+                };
+                long line = 0;
+                auto lit = e.find("line");
+                if (lit != e.end() && lit->is_number_integer()) line = lit->get<long>();
+                push_cursor(gs("index"), gs("file"), line, gs("name"));
+            }
+        };
+        push_edges(out["callers"]);
+        push_edges(out["callees"]);
+        // Related uses "path"/"chunk" instead of "file"/"name".
+        if (out["related"].is_array()) {
+            for (const auto& r : out["related"]) {
+                if (!r.is_object()) continue;
+                auto gs = [&](const char* k) {
+                    auto it = r.find(k);
+                    return (it != r.end() && it->is_string()) ? it->get<std::string>() : std::string();
+                };
+                long line = 0;
+                auto lit = r.find("line");
+                if (lit != r.end() && lit->is_number_integer()) line = lit->get<long>();
+                push_cursor(gs("index"), gs("path"), line, gs("chunk"));
+            }
+        }
+        s.set_last_results(cursors);
+    }
 
     return ToolResult::ok(std::move(out));
 }
