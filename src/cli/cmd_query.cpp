@@ -79,14 +79,25 @@ int cmd_query(const Args& args) {
 // --- cmd_list ---
 
 int cmd_list(const Args& args) {
+    // No index given: list the available indexes (discovery view). This mirrors
+    // query/explore/calls treating "no index" as "operate across all indexes",
+    // and answers "what can I list/query?". `gogol status` remains the daemon /
+    // health / indexing-progress diagnostic; `list` is the entry-point summary.
     if (args.name.empty()) {
-        cerr << "Usage: gogol list [doc|note|term] <index>\n"
-             << "  gogol list web              # all entries in web\n"
-             << "  gogol list doc web          # only file (doc) entries\n"
-             << "  gogol list note web         # only note entries\n"
-             << "  gogol list term web         # only glossary terms\n"
-             << "Use 'gogol status' for index overview.\n";
-        return 1;
+        auto configs = load_config();
+        for (auto& [cfg_name, cfg] : configs) {
+            if (!cfg.is_indexed()) continue;
+            auto backend = open_backend(cfg_name);
+            auto c = backend->load_index_counts();
+            int term_count = (int)backend->load_glossary().size();
+            if (g_format == OutputFormat::AGENT)
+                printf("%s\t%d\t%d\t%d\n", cfg_name.c_str(),
+                       c.file_count, c.mem_count, term_count);
+            else
+                printf("%-14s %5d doc %4d note %4d term\n", cfg_name.c_str(),
+                       c.file_count, c.mem_count, term_count);
+        }
+        return 0;
     }
 
     RpcClient rpc;
