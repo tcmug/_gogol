@@ -220,7 +220,7 @@ CLI commands connect to the daemon over the unix socket. Direct/standalone mode 
 
 Network: `gogol serve --tcp 0.0.0.0:9400` enables TCP. Encrypted with XChaCha20-Poly1305 when `[keys]` section exists in config. Client uses `GOGOL_HOST`, `GOGOL_KEY_NAME`, `GOGOL_KEY` env vars.
 
-File watching: `watch = true` in config. Daemon monitors indexed paths, debounces changes, triggers incremental reindex. Branch switches handled naturally.
+File watching: on by default (`watch = true` in `[global]`); overridable per index (an index's own `watch` / `watch_debounce_ms` wins). Daemon monitors indexed paths, debounces changes, triggers incremental reindex. Branch switches handled naturally.
 
 RPC commands: PING (returns build version), SHUTDOWN, QUERY, ADD, RM, GET, LIST, INDEX, STATUS.
 
@@ -297,7 +297,9 @@ gogol list note web                         # only memory notes in web
 `~/.gogol/config`:
 
 ```ini
+[global]
 model = ~/models/nomic-embed-text-v1.5.Q8_0.gguf
+watch = true
 
 [web]
 path = ~/projects/web
@@ -386,7 +388,7 @@ gogol serve --stop
 
 ## Common issues
 
-- **Model not found**: Set `model` in `~/.gogol/config` (before first `[section]`)
+- **Model not found**: Set `model` in `~/.gogol/config` (in the `[global]` section, or a bare key before the first `[section]`)
 - **Abort trap on encode**: n_ubatch < n_tokens. Check embedder.cpp context params.
 - **Old index not loading**: Schema/format mismatch. Re-index with `gogol index --index <name> --force` (or delete `~/.gogol/indexes/<name>.db` and re-index).
 - **No files found**: Check `~/.gogolignore` patterns. Only `.git` is skipped by default.

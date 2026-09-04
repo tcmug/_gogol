@@ -805,9 +805,17 @@ int run_embed_server(const string &model_path, bool foreground,
   if (tcp_fd >= 0) fprintf(stderr, " TCP: %s", tcp_addr.c_str());
   fprintf(stderr, "\n");
 
-  // File watcher: auto-reindex on filesystem changes
+  // File watcher: auto-reindex on filesystem changes. Start it if watching is
+  // effectively enabled for ANY index — the global default OR a per-index
+  // override can turn it on. Per-index enable/debounce is resolved inside
+  // start_file_watcher via effective_watch().
   auto gc = load_global_config();
-  if (gc.watch) {
+  bool any_watch = gc.watch;
+  if (!any_watch) {
+    for (auto &[nm, cfg] : st.configs)
+      if (effective_watch(cfg, gc)) { any_watch = true; break; }
+  }
+  if (any_watch) {
     auto reindex_cb = [](const string &idx_name, void *ctx) {
       auto *state = static_cast<DaemonState *>(ctx);
       if (!state->configs.count(idx_name)) return;

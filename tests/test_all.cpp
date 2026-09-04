@@ -1532,10 +1532,64 @@ void test_mcp_session_cursors() {
 
 #undef SCHECK
 
+// --- Config: [global] section + per-index watch override ---
+
+void test_config_global_and_watch_override() {
+    TEST(config_global_and_watch_override);
+    fs::path home = fs::temp_directory_path() / "gogol-test-cfg";
+    fs::create_directories(home / ".gogol");
+    // watch on by default via [global]; index "off" overrides to off,
+    // index "on" overrides debounce, index "inherit" takes the global values.
+    {
+        std::ofstream f(home / ".gogol" / "config");
+        f << "[global]\n"
+          << "watch = true\n"
+          << "watch_debounce_ms = 3000\n\n"
+          << "[inherit]\npath = /tmp/a\next = md\n\n"
+          << "[off]\npath = /tmp/b\next = md\nwatch = false\n\n"
+          << "[tuned]\npath = /tmp/c\next = md\nwatch_debounce_ms = 500\n";
+    }
+    const char* old_home = getenv("HOME");
+    setenv("HOME", home.c_str(), 1);
+
+    auto gc = load_global_config();
+    assert(gc.watch == true);              // [global] parsed
+    assert(gc.watch_debounce_ms == 3000);
+
+    auto cfgs = load_config();
+    assert(cfgs.count("inherit") && cfgs.count("off") && cfgs.count("tuned"));
+    // [global] must NOT become an index.
+    assert(!cfgs.count("global"));
+
+    // inherit: no override → global values.
+    assert(effective_watch(cfgs["inherit"], gc) == true);
+    assert(effective_watch_debounce_ms(cfgs["inherit"], gc) == 3000);
+    // off: overrides watch to false.
+    assert(effective_watch(cfgs["off"], gc) == false);
+    // tuned: watch inherited on, debounce overridden.
+    assert(effective_watch(cfgs["tuned"], gc) == true);
+    assert(effective_watch_debounce_ms(cfgs["tuned"], gc) == 500);
+
+    // Legacy top-level keys (no [global]) still work.
+    {
+        std::ofstream f(home / ".gogol" / "config");
+        f << "watch = false\n\n[a]\npath = /tmp/a\next = md\nwatch = true\n";
+    }
+    auto gc2 = load_global_config();
+    assert(gc2.watch == false);            // legacy top-level parsed
+    auto cfgs2 = load_config();
+    assert(effective_watch(cfgs2["a"], gc2) == true); // index override wins
+
+    if (old_home) setenv("HOME", old_home, 1); else unsetenv("HOME");
+    fs::remove_all(home);
+    PASS();
+}
+
 // --- Main ---
 
 int main() {
     printf("Running gogol tests...\n\n");
+    test_config_global_and_watch_override();
 
     printf("[Scanner]\n");
     test_scanner_finds_md_files();

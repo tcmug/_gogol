@@ -429,8 +429,10 @@ Staleness: `(stale)` / `(missing)` suffix in default mode, `~` / `!` suffix in a
 `~/.gogol/config` (INI format):
 
 ```ini
+[global]
 model = ~/.gogol/models/nomic-embed-text-v1.5.Q4_K_M.gguf
 precision = f16
+watch = true
 
 [web]
 path = ~/projects/web
@@ -464,8 +466,11 @@ Per-index fields (inside a `[name]` section):
 | `mode` | No | `r` | Access mode (`r` or `rw`) |
 | `model` | No | global `model` | Override the embedding model for this index |
 | `memory` | No | `~/.gogol/memory/{name}` | Override the memory-note store directory |
+| `watch` | No | global `watch` | Override auto-reindex for this index (`true`/`false`) |
+| `watch_debounce_ms` | No | global `watch_debounce_ms` | Override the debounce window for this index |
 
-Global keys (before the first `[section]`):
+Global keys — put them in a `[global]` section (or, for backward
+compatibility, as bare keys before the first `[section]`):
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -473,19 +478,40 @@ Global keys (before the first `[section]`):
 | `precision` | `f32` | Stored embedding precision (`f32` or `f16`) |
 | `tcp` | — | TCP listen address (e.g. `0.0.0.0:9400`); enables remote access |
 | `batch_size` | (embedder default) | Embedding batch size |
-| `watch` | `false` | Auto-reindex on filesystem changes |
+| `watch` | `true` | Auto-reindex on filesystem changes (default on) |
 | `watch_debounce_ms` | `2000` | Debounce window before a watch-triggered reindex |
+
+`model`, `precision`, `batch_size`, and `tcp` are program/server-level and
+apply globally. Only `watch` and `watch_debounce_ms` can additionally be
+overridden per index — the global value is the default, and an index's own
+`watch` / `watch_debounce_ms` key wins for that index.
 
 ### File Watching
 
-The daemon can auto-reindex when files change. Enable in config:
+The daemon auto-reindexes when files change — this is **on by default**
+(`watch = true`). To change the global default or the debounce window, set them
+in `[global]`:
 
 ```ini
+[global]
 watch = true
 watch_debounce_ms = 2000
 ```
 
-When enabled, the daemon monitors all configured index paths for filesystem changes (FSEvents on macOS, inotify on Linux). After changes settle (debounce period), triggers incremental reindex — updates embeddings, keywords, call graph, and import graph. Branch switches are handled naturally (many files change → batch reindex after settling).
+Watching can be overridden per index — e.g. watch active repos but skip a large
+static tree:
+
+```ini
+[archive]
+path = ~/old/archive
+watch = false            ; this index won't auto-reindex
+
+[web]
+path = ~/projects/web
+watch_debounce_ms = 5000 ; longer debounce for a churny repo
+```
+
+When enabled, the daemon monitors the configured index paths for filesystem changes (FSEvents on macOS, inotify on Linux). After changes settle (debounce period), it triggers an incremental reindex — updating embeddings, keywords, call graph, and import graph. Branch switches are handled naturally (many files change → batch reindex after settling).
 
 ### Modes
 

@@ -35,6 +35,7 @@ static int g_debounce_ms = 2000;
 static WatchCallback g_callback = nullptr;
 static void *g_callback_ctx = nullptr;
 static std::map<std::string, std::set<std::string>> g_index_exts; // index name → watched extensions
+static std::map<std::string, int> g_index_debounce; // index name → effective debounce ms
 
 // Debounce: fire callback after events settle
 static void debounce_loop() {
@@ -47,7 +48,10 @@ static void debounce_loop() {
       for (auto it = g_pending.begin(); it != g_pending.end();) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                            now - it->second).count();
-        if (elapsed >= g_debounce_ms) {
+        int debounce = g_debounce_ms;
+        auto dit = g_index_debounce.find(it->first);
+        if (dit != g_index_debounce.end()) debounce = dit->second;
+        if (elapsed >= debounce) {
           ready.push_back(it->first);
           it = g_pending.erase(it);
         } else {
@@ -219,6 +223,7 @@ bool start_file_watcher(int debounce_ms, WatchCallback callback, void *ctx) {
 #else
   auto configs = load_config();
   if (configs.empty()) return false;
+  auto gc = load_global_config();
 
   g_debounce_ms = debounce_ms;
   g_callback = callback;
@@ -227,6 +232,14 @@ bool start_file_watcher(int debounce_ms, WatchCallback callback, void *ctx) {
   std::vector<std::string> dirs;
   for (auto &[name, cfg] : configs) {
     if (!cfg.is_indexed() || cfg.paths.empty()) continue;
+    // Honor the per-index watch override (global default unless the index
+    // sets its own `watch =`). Indexes with watch off are not scheduled.
+    if (!effective_watch(cfg, gc)) continue;
+    // Record this index's effective debounce (per-index override or global).
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      g_index_debounce[name] = effective_watch_debounce_ms(cfg, gc);
+    }
     for (auto &p : cfg.paths) {
       if (fs::exists(p)) {
         std::string canonical = fs::canonical(p).string();

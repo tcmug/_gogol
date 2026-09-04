@@ -58,7 +58,9 @@ std::map<std::string, IndexConfig> load_config() {
       current_section = line.substr(1, line.size() - 2);
       continue;
     }
-    if (current_section.empty() || current_section == "keys" || current_section == "chunkers")
+    if (current_section.empty() || current_section == "keys" ||
+        current_section == "chunkers" || current_section == "global" ||
+        current_section == "mcp")
       continue;
 
     // Key = value
@@ -94,6 +96,11 @@ std::map<std::string, IndexConfig> load_config() {
       configs[current_section].model = expand_home(value);
     } else if (key == "memory") {
       configs[current_section].memory = expand_home(value);
+    } else if (key == "watch") {
+      bool on = (value == "true" || value == "1" || value == "yes");
+      configs[current_section].watch_override = on ? 1 : 0;
+    } else if (key == "watch_debounce_ms") {
+      configs[current_section].watch_debounce_ms_override = std::atoi(value.c_str());
     }
   }
   // Fill in each index's own name (used for the default memory dir).
@@ -110,14 +117,16 @@ GlobalConfig load_global_config() {
     return gc;
 
   std::string line;
-  bool in_global = true; // before first section = global
+  bool in_global = true; // before first section = global (legacy top-level keys)
   bool in_mcp = false;   // inside the [mcp] section
   while (std::getline(f, line)) {
     line = trim(line);
     if (line.empty() || line[0] == '#')
       continue;
     if (line.front() == '[' && line.back() == ']') {
-      in_global = false;
+      // Both the legacy pre-section top-level keys AND an explicit [global]
+      // section feed GlobalConfig, so either form works (back-compatible).
+      in_global = (line == "[global]");
       in_mcp = (line == "[mcp]");
       continue;
     }
@@ -158,6 +167,18 @@ GlobalConfig load_global_config() {
       gc.precision = (value == "f16") ? EmbedPrecision::F16 : EmbedPrecision::F32;
   }
   return gc;
+}
+
+bool effective_watch(const IndexConfig &idx, const GlobalConfig &g) {
+  if (idx.watch_override == -1)
+    return g.watch;              // inherit global default
+  return idx.watch_override == 1; // explicit per-index override
+}
+
+int effective_watch_debounce_ms(const IndexConfig &idx, const GlobalConfig &g) {
+  if (idx.watch_debounce_ms_override < 0)
+    return g.watch_debounce_ms;  // inherit global default
+  return idx.watch_debounce_ms_override;
 }
 
 static uint8_t hex_nibble(char c) {
