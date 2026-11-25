@@ -2,15 +2,26 @@
 #include "config/debug.h"
 
 #include <cmath>
+#include <cstring>
 #include <iostream>
 
+#include "embedding/model_prefixes.h"
 #include "ggml.h"
 #include "llama.h"
 
-Embedder::Embedder(const std::string &model_path) {
+Embedder::Embedder(const std::string &model_path,
+                   const std::optional<std::string> &query_prefix,
+                   const std::optional<std::string> &document_prefix) {
   static bool backend_initialized = false;
   if (!backend_initialized) {
-    llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
+    // Silence llama.cpp's log entirely by default. llama prints verbose load
+    // info (tensor assignments, graph dumps) AND a "." per percent of model
+    // load via GGML_LOG_LEVEL_CONT (llama.cpp:419) — all noise for normal CLI
+    // use. To see the log for debugging (e.g. to confirm GPU offload), set
+    // GOGOL_LLAMA_LOG=1 in the environment.
+    if (!std::getenv("GOGOL_LLAMA_LOG")) {
+      llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+    }
     llama_backend_init();
     backend_initialized = true;
   }
@@ -23,9 +34,19 @@ Embedder::Embedder(const std::string &model_path) {
   }
 
   auto cparams = llama_context_default_params();
-  cparams.n_ctx = 2048;
-  cparams.n_batch = 4096;
-  cparams.n_ubatch = 4096;
+  // INVARIANT §5 (docs/INVARIANTS.md): the embedder must be model-agnostic and llama
+  // violates these constraints by ASSERTING/segfaulting, not returning an error.
+  // Context size must come from the MODEL, not a hardcoded constant: a 512-token
+  // model (MiniLM/bge-small) aborts if asked for 2048, and a larger model would be
+  // mis-sized. Use the model's trained context length, clamped to a sane range.
+  int32_t n_train = llama_model_n_ctx_train(model_);
+  int32_t n_ctx = n_train > 0 ? n_train : 2048;
+  if (n_ctx > 8192) n_ctx = 8192;   // cap memory for very-long-context models
+  if (n_ctx < 128)  n_ctx = 128;    // floor
+  cparams.n_ctx = n_ctx;
+  // batch/ubatch must not exceed n_ctx (llama requires n_batch <= n_ctx for embeddings).
+  cparams.n_batch = n_ctx;
+  cparams.n_ubatch = n_ctx;
   cparams.n_seq_max = 8;
   cparams.embeddings = true;
 
@@ -37,6 +58,26 @@ Embedder::Embedder(const std::string &model_path) {
 
   n_embd_ = llama_model_n_embd(model_);
   n_ctx_ = cparams.n_ctx;
+
+  // Resolve retrieval prefixes: an explicit override (config) wins; otherwise
+  // auto-select from the model's architecture (GGUF general.architecture). The
+  // prefix convention is a per-model training detail NOT stored in the GGUF, so a
+  // small built-in table maps known architectures to their prefixes; an unknown
+  // architecture falls back to empty (safe — degrades to raw text, no wrong prefix).
+  {
+    std::string arch;
+    char buf[128];
+    int n = llama_model_meta_val_str(model_, "general.architecture", buf, sizeof(buf));
+    if (n > 0) arch.assign(buf, n);
+    auto defaults = default_prefixes_for_arch(arch);
+    query_prefix_    = query_prefix.value_or(defaults.first);
+    document_prefix_ = document_prefix.value_or(defaults.second);
+    if (!query_prefix && !document_prefix && defaults.first.empty() &&
+        defaults.second.empty() && !arch.empty())
+      std::cerr << "gogol: unknown embedding architecture '" << arch
+                << "' — using empty retrieval prefixes (set query_prefix/"
+                << "document_prefix in ~/.gogol/config if this model needs them)\n";
+  }
 }
 
 Embedder::~Embedder() {
@@ -65,9 +106,18 @@ std::vector<float> Embedder::embed(const std::string &text) {
     return {};
 
   // Truncate to context size
-  int n_ctx = llama_n_ctx(ctx_);
-  if (n_tokens > n_ctx)
-    n_tokens = n_ctx;
+  // INVARIANT §5 (docs/INVARIANTS.md): non-causal models need the whole sequence in
+  // ONE micro-batch. Cap at min(n_ctx, n_ubatch) — n_ctx alone trips the assert because
+  // llama rounds it up above n_ubatch (bug 85b7b80).
+  // Truncate so the sequence fits the encode. Embedding models are non-causal:
+  // llama asserts n_ubatch >= n_tokens (the whole sequence must fit ONE micro-batch,
+  // no chunked prefill). So cap at min(n_ctx, n_ubatch) — n_ctx alone is not enough
+  // because llama may round n_ctx up above n_ubatch, tripping the encoder assert.
+  int n_ctx = static_cast<int>(llama_n_ctx(ctx_));
+  int n_ubatch = static_cast<int>(llama_n_ubatch(ctx_));
+  int cap = n_ctx < n_ubatch ? n_ctx : n_ubatch;
+  if (n_tokens > cap)
+    n_tokens = cap;
 
   // Use llama_encode (no KV cache needed for embeddings)
   llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
@@ -102,17 +152,20 @@ std::vector<float> Embedder::embed(const std::string &text) {
 }
 
 std::vector<float> Embedder::embed_document(const std::string &text) {
-  return embed("search_document: " + text);
+  std::scoped_lock lk(mu_);
+  return embed(document_prefix_ + text);
 }
 
 std::vector<float> Embedder::embed_query(const std::string &text) {
-  return embed("search_query: " + text);
+  std::scoped_lock lk(mu_);
+  return embed(query_prefix_ + text);
 }
 
 std::vector<std::vector<float>>
 Embedder::embed_documents_batch(const std::vector<std::string> &texts) { DBG("embed_batch: %zu texts", texts.size());
   if (texts.empty())
     return {};
+  std::scoped_lock lk(mu_);
 
   const llama_vocab *vocab = llama_model_get_vocab(model_);
 
@@ -124,7 +177,7 @@ Embedder::embed_documents_batch(const std::vector<std::string> &texts) { DBG("em
   seqs.reserve(texts.size());
 
   for (auto &text : texts) {
-    std::string prefixed = "search_document: " + text;
+    std::string prefixed = document_prefix_ + text;
     int n = prefixed.size() + 16;
     std::vector<llama_token> tokens(n);
     n = llama_tokenize(vocab, prefixed.c_str(), prefixed.size(), tokens.data(),

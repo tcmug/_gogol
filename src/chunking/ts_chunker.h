@@ -12,6 +12,7 @@ std::vector<Chunk> chunk_treesitter(const std::string &content,
 // Check if tree-sitter grammar is available for this extension
 bool has_treesitter_grammar(const std::string &ext);
 
+
 // Call-graph edge extracted from AST
 struct CallEdge {
     std::string caller;

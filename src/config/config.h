@@ -1,72 +1,65 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
-enum class IndexMode { R, RW };
-
+// Synthesized per-repo config for the ingest pipeline (refresh_repo builds one from
+// the git identity; FileAdapter reads paths+extensions). NOT parsed from a config file
+// anymore — the per-[index] section model was removed with zero-config auto-indexing.
 struct IndexConfig {
-    std::string name;                    // index name (section header)
-    std::vector<std::string> paths;
+    std::string name;                    // index identity (becomes entries.idx)
+    std::vector<std::string> paths;      // scan roots (FileAdapter)
     std::vector<std::string> extensions; // with dots: ".md", ".ts"
-    IndexMode mode = IndexMode::R;
-    std::string model; // GGUF model path (optional, overrides global)
-    std::string memory; // memory dir (optional; default ~/.gogol/memory/<name>)
-
-    // Per-index watch overrides (tri-state: -1 = inherit global default).
-    // watch_override:            -1 inherit, 0 off, 1 on
-    // watch_debounce_ms_override: -1 inherit, else the override value (ms)
-    // Only `watch`/`watch_debounce_ms` are per-index overridable — they are the
-    // only config keys where a per-index value is functionally meaningful
-    // (watch active repos, skip huge/static trees). model/precision/batch_size/
-    // tcp/mcp are program- or server-level and stay global-only.
-    int watch_override = -1;
-    int watch_debounce_ms_override = -1;
-
-    // Whether gogol may write files under `paths`. The memory dir is always
-    // writable regardless of this (see memory_dir()).
-    bool is_writable() const { return mode == IndexMode::RW; }
-    // All configured indexes are searched. (Kept for call-site clarity.)
-    bool is_indexed() const { return true; }
-
-    // Resolved memory directory: explicit `memory` or default under ~/.gogol.
-    // The memory dir is always writable (holds note/term entries),
-    // independent of `mode` (which only governs writes to `paths`).
-    std::string memory_dir() const;
 };
 
 // Global config (top-level keys outside sections)
-enum class EmbedPrecision : uint8_t { F32 = 0, F16 = 1 };
-
 struct GlobalConfig {
-    std::string model; // default model path
-    std::string tcp;   // TCP listen address (empty = disabled)
-    int batch_size = 32; // embedding batch size
-    bool watch = true;  // enable filesystem watching in daemon (default on)
-    int watch_debounce_ms = 2000; // debounce interval for watch events
-    EmbedPrecision precision = EmbedPrecision::F32;
+    std::string model; // default model path (empty = use GOGOL_MODEL / ~/.gogol/model)
+    // Retrieval handshake prefixes — a per-MODEL property. std::nullopt = AUTO-SELECT
+    // from the model's architecture (Embedder::default_prefixes_for_arch); a value
+    // OVERRIDES for an unknown/custom model. Wrong prefix => degenerate ranking.
+    std::optional<std::string> query_prefix;
+    std::optional<std::string> document_prefix;
 
-    // [mcp] section — the MCP server is opt-in (off unless enabled).
+    // [mcp] section — the MCP server is opt-in (off unless enabled). `gogol mcp` is a
+    // local stdio tool, so there is no per-tool gate; this single switch starts it.
     bool mcp_enabled = false;      // [mcp] enabled = true|false (default false)
-    std::string mcp_tools = "read"; // [mcp] tools = read|read-write (default read)
+    int http_port = 0;             // [mcp] http_port = N (0 = serve disabled)
+    std::string http_host = "127.0.0.1"; // [mcp] http_host = ... (default loopback)
 
-    // Whether write tools should be exposed / allowed over MCP.
-    bool mcp_read_write() const { return mcp_tools == "read-write"; }
+    // Daemon transport (shared warm instance, sole SQLite writer). The daemon can serve
+    // a local UNIX SOCKET (thin stdio shims connect to it — no TCP, no LAN exposure) AND
+    // optionally HTTP (above) at the same time; a deployment enables whichever it needs.
+    bool socket_enabled = false;   // [mcp] socket = on|off (default off)
+    std::string socket_path;       // [mcp] socket_path = ... (default: gogol_home/daemon.sock)
+    int idle_timeout_secs = 0;     // [mcp] idle_timeout_secs = N (0 = never idle-exit)
+
+    // Agent messaging over MCP (combadge bus): advertises `listen`/`send` in tools/list and
+    // adds an unread-count hint to results for callers that pass `me`. Off = invisible.
+    bool messaging = false;        // [mcp] messaging = true|false (default false)
 };
 
-// Load ~/.gogol/config, returns map of name → config
-std::map<std::string, IndexConfig> load_config();
 GlobalConfig load_global_config();
 
-// Resolve the effective watch settings for an index: the per-index override if
-// set, otherwise the global default. Keeps the "global default → per-index
-// override" precedence in one place.
-bool effective_watch(const IndexConfig &idx, const GlobalConfig &g);
-int effective_watch_debounce_ms(const IndexConfig &idx, const GlobalConfig &g);
+// --- gogol home directory (single source; overridable) ---
+// The convention home for all gogol state (model symlink, cache.db, notes.db).
+// Resolution: $GOGOL_HOME if set, else $HOME/.gogol. This is the ONE place the
+// ".gogol" path is derived — every consumer builds on gogol_home() rather than
+// re-deriving getenv("HOME")+"/.gogol" (which was duplicated across ~8 sites).
+std::string gogol_home();
+// Derived paths under gogol_home():
+std::string cache_db_path();  // gogol_home()/cache.db — derived/disposable store
+std::string notes_db_path();  // gogol_home()/notes.db — disposable-but-not-re-derivable notes
+std::string messages_db_path(); // gogol_home()/messages.db — combadge bus queue (ADR-003)
+std::string model_path();     // gogol_home()/model (symlink) unless GOGOL_MODEL overrides
+std::string config_file_path(); // gogol_home()/config — the INI file (GOGOL_HOME isolates it)
 
-// Load [keys] section: name → 32-byte key (from hex)
-std::map<std::string, std::vector<uint8_t>> load_keys();
+// Expand a leading ~ or ~/ to $HOME (the ONE tilde-expansion helper; callers in
+// config/git_identity/refresh all use it). A bare "~" and "~/x" both expand; anything
+// else is returned unchanged. No-op if $HOME is unset.
+std::string expand_tilde(const std::string &path);
 
 // Load [chunkers] section: extensions (comma-sep) → regex pattern
 struct ChunkerDef {
@@ -74,3 +67,22 @@ struct ChunkerDef {
     std::string pattern;                 // regex
 };
 std::vector<ChunkerDef> load_chunker_config();
+
+// --- Automatic daily backup of notes.db (Fibonacci retention) ---
+// cache.db is derived/rebuildable, so it is NOT backed up. notes.db is the
+// LLM-authored content of record — NOT rebuildable — so it alone gets backed up.
+//
+// One backup per calendar day of notes.db (and its -wal/-shm sidecars) into
+// gogol_home()/backups/YYYY-MM-DD/. At most one backup per day — the dated
+// directory name itself is the guard (re-running the same day is a no-op).
+//
+// Retention follows a Fibonacci schedule up to 13 days: backups are kept for ages
+// {1,2,3,5,8,13} days. A backup older than 13 days is deleted; a backup whose age
+// is not in the set is also deleted (so only the 6 Fibonacci-aged snapshots survive
+// at steady state). Dense recent coverage + sparse older snapshots.
+//
+// Best-effort, non-throwing: any copy/IO error is swallowed (a backup failure must
+// never block a gogol invocation). Failures land on stderr only when GOGOL_DEBUG.
+// Idempotent: safe to call on every CLI/MCP startup. Skips silently if notes.db
+// doesn't exist yet (fresh install) or today's backup already exists.
+void maybe_backup_dbs();

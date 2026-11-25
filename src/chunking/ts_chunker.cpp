@@ -16,6 +16,7 @@ const TSLanguage *tree_sitter_rust(void);
 const TSLanguage *tree_sitter_c(void);
 const TSLanguage *tree_sitter_cpp(void);
 const TSLanguage *tree_sitter_php(void);
+const TSLanguage *tree_sitter_gdscript(void);
 }
 
 static const TSLanguage *get_language(const std::string &ext) {
@@ -35,6 +36,8 @@ static const TSLanguage *get_language(const std::string &ext) {
     return tree_sitter_cpp();
   if (ext == ".php")
     return tree_sitter_php();
+  if (ext == ".gd")
+    return tree_sitter_gdscript();
   return nullptr;
 }
 
@@ -78,6 +81,31 @@ static std::string find_name(const std::string &content, TSNode node,
       if (!name.empty())
         return name;
     }
+  }
+  return "";
+}
+
+// Fallback name: the first identifier-like token anywhere in the subtree (deeper
+// than find_name's bounded walk). Returns "" if none — NEVER a node-type token.
+static std::string first_identifier(const std::string &content, TSNode node, int depth = 0) {
+  if (depth > 6) return "";
+  uint32_t count = ts_node_child_count(node);
+  for (uint32_t i = 0; i < count; i++) {
+    TSNode child = ts_node_child(node, i);
+    const char *type = ts_node_type(child);
+    if ((std::strstr(type, "identifier") || std::strcmp(type, "name") == 0 ||
+         std::strstr(type, "property_identifier"))) {
+      uint32_t s = ts_node_start_byte(child), e = ts_node_end_byte(child);
+      if (e > s && e - s < 80) {
+        std::string t = content.substr(s, e - s);
+        // skip trivial keywords that aren't useful names
+        if (t != "const" && t != "let" && t != "var" && t != "async" &&
+            t != "function" && t != "return" && t != "await")
+          return t;
+      }
+    }
+    std::string deeper = first_identifier(content, child, depth + 1);
+    if (!deeper.empty()) return deeper;
   }
   return "";
 }
@@ -178,7 +206,6 @@ std::vector<Chunk> chunk_treesitter(const std::string &content,
 
   std::vector<Chunk> chunks;
   std::string pending;
-  uint32_t pending_line = 1;
 
   for (uint32_t i = 0; i < child_count; i++) {
     TSNode child = ts_node_child(root, i);
@@ -191,8 +218,6 @@ std::vector<Chunk> chunk_treesitter(const std::string &content,
 
     // Skip comment and import nodes
     if (std::strstr(type, "comment") || std::strstr(type, "import")) {
-      if (pending.empty())
-        pending_line = start_line;
       if (!pending.empty())
         pending += "\n";
       pending += content.substr(start_byte, end_byte - start_byte);
@@ -208,7 +233,10 @@ std::vector<Chunk> chunk_treesitter(const std::string &content,
       // Build enriched chunk
       std::string name = find_name(content, child);
       if (name.empty())
-        name = type;
+        name = first_identifier(content, child);   // real token, never a node-type
+      // If still empty, leave the name blank rather than leak the AST node type
+      // (e.g. "expression_statement") into the heading + embed text — that token
+      // is pure noise that pollutes search, clustering, and derived axis names.
 
       // Improvement 3: parent context
       std::string parent_name = find_parent_name(content, child);
@@ -245,7 +273,7 @@ std::vector<Chunk> chunk_treesitter(const std::string &content,
       // Improvement 4: build chunk content with name repetition + comment +
       // code
       std::string chunk_content;
-      chunk_content += name + ". ";
+      if (!name.empty()) chunk_content += name + ". ";
       if (!comment.empty())
         chunk_content += comment + "\n";
       chunk_content += node_text;
@@ -253,8 +281,6 @@ std::vector<Chunk> chunk_treesitter(const std::string &content,
       chunks.push_back({heading, start_line, end_line, chunk_content});
     } else {
       // Accumulate small nodes
-      if (pending.empty())
-        pending_line = start_line;
       if (!pending.empty())
         pending += "\n";
       pending += node_text;
@@ -277,9 +303,10 @@ std::vector<Chunk> chunk_treesitter(const std::string &content,
 // Check if node type is a call expression (language-dependent)
 static bool is_call_node(const char *type) {
   return std::strcmp(type, "call_expression") == 0 ||      // TS, C, Go, Rust
-         std::strcmp(type, "call") == 0 ||                 // Python
+         std::strcmp(type, "call") == 0 ||                 // Python, GDScript
          std::strcmp(type, "function_call_expression") == 0 || // PHP
-         std::strcmp(type, "member_call_expression") == 0;    // PHP method calls
+         std::strcmp(type, "member_call_expression") == 0 || // PHP method calls
+         std::strcmp(type, "attribute_call") == 0;           // GDScript method calls
 }
 
 // Check if node type is a method/field access expression
@@ -287,7 +314,8 @@ static bool is_member_access(const char *type) {
   return std::strcmp(type, "member_expression") == 0 ||   // TS
          std::strcmp(type, "field_expression") == 0 ||    // C, Rust
          std::strcmp(type, "selector_expression") == 0 || // Go
-         std::strcmp(type, "attribute") == 0;             // Python
+         std::strcmp(type, "attribute") == 0 ||            // Python
+         std::strcmp(type, "attribute_expression") == 0;   // GDScript
 }
 
 // Extract the method/property name from a member access node
@@ -350,7 +378,7 @@ static void collect_calls(const std::string &src, TSNode node,
 // Check if node is a function/method definition (any language)
 static bool is_function_def(const char *type) {
   return std::strcmp(type, "function_declaration") == 0 ||  // TS, Go
-         std::strcmp(type, "function_definition") == 0 ||   // C, Python, PHP
+         std::strcmp(type, "function_definition") == 0 ||   // C, Python, PHP, GDScript
          std::strcmp(type, "function_item") == 0 ||         // Rust
          std::strcmp(type, "method_definition") == 0 ||     // TS class methods
          std::strcmp(type, "method_declaration") == 0;      // Go methods, PHP methods
@@ -359,18 +387,19 @@ static bool is_function_def(const char *type) {
 // Check if node is a class/struct/impl container
 static bool is_class_container(const char *type) {
   return std::strstr(type, "class_declaration") ||
-         std::strstr(type, "class_definition") ||  // Python
+         std::strstr(type, "class_definition") ||  // Python, GDScript
          std::strcmp(type, "impl_item") == 0 ||    // Rust
          std::strstr(type, "struct");
 }
 
 // Check if node is a function body
 static bool is_body_node(const char *type) {
-  return std::strstr(type, "body") ||
+  return std::strstr(type, "body") ||                 // TS, GDScript
          std::strstr(type, "block") ||
          std::strcmp(type, "compound_statement") == 0 ||   // C, PHP
          std::strcmp(type, "declaration_list") == 0 ||     // PHP class body
-         std::strcmp(type, "statement_list") == 0;         // Go (inside block)
+         std::strcmp(type, "statement_list") == 0 ||       // Go (inside block)
+         std::strcmp(type, "_compound_statement") == 0;   // GDScript
 }
 
 // Shared AST walker: finds all function definitions and calls visitor for each.
@@ -451,6 +480,37 @@ static void calls_visitor(const std::string &src, const std::string &name,
   collect_calls(src, body_node, name, *edges);
 }
 
+// Calls-only second pass for the HOF/handler-wrapper pattern:
+//   const handler = middyWrapper(async () => processSingle(...))
+// walk_functions only visits DIRECT arrow/function values, so calls inside arrows
+// passed as CALL ARGUMENTS get no caller. Here we find `const x = <call>` bindings
+// and attribute the calls inside that value to `x`. collect_calls descends into
+// arrows but skips NAMED nested fns (which get their own caller), so attribution
+// stays with the binding. Calls-only (NOT in the shared walker) so metrics — which
+// must measure real function bodies — is unaffected.
+static void collect_hof_binding_calls(const std::string &src, TSNode node,
+                                       std::vector<CallEdge> &edges) {
+  const char *type = ts_node_type(node);
+  if (std::strcmp(type, "variable_declarator") == 0) {
+    std::string var_name = find_name(src, node);
+    if (!var_name.empty()) {
+      uint32_t vc = ts_node_child_count(node);
+      for (uint32_t k = 0; k < vc; k++) {
+        TSNode val = ts_node_child(node, k);
+        const char *vt = ts_node_type(val);
+        // Only the call/await-wrapped case; direct arrows/functions/objects are
+        // already handled by walk_functions (avoid double-attribution).
+        if (std::strstr(vt, "call_expression") || std::strstr(vt, "await_expression")) {
+          collect_calls(src, val, var_name, edges);
+        }
+      }
+    }
+  }
+  uint32_t count = ts_node_child_count(node);
+  for (uint32_t i = 0; i < count; i++)
+    collect_hof_binding_calls(src, ts_node_child(node, i), edges);
+}
+
 std::vector<CallEdge> extract_calls(const std::string &content,
                                     const std::string &ext) {
   const TSLanguage *lang = get_language(ext);
@@ -463,6 +523,8 @@ std::vector<CallEdge> extract_calls(const std::string &content,
 
   std::vector<CallEdge> edges;
   walk_functions(content, ts_tree_root_node(tree), "", calls_visitor, &edges);
+  // second, calls-only pass: attribute HOF/wrapper-bound arrow calls to their binding.
+  collect_hof_binding_calls(content, ts_tree_root_node(tree), edges);
 
   ts_tree_delete(tree);
   ts_parser_delete(parser);
@@ -629,7 +691,9 @@ static bool is_decision(const char *type) {
          std::strcmp(type, "switch_case") == 0 ||
          std::strcmp(type, "case_statement") == 0 ||
          std::strcmp(type, "conditional_expression") == 0 ||
-         std::strcmp(type, "ternary_expression") == 0;
+         std::strcmp(type, "ternary_expression") == 0 ||
+         std::strcmp(type, "elif_clause") == 0 ||      // GDScript
+         std::strcmp(type, "match_statement") == 0;    // GDScript
 }
 
 // Check if node is a logical operator (&&, ||)
@@ -702,7 +766,7 @@ static int count_params(TSNode params_node) {
 }
 
 // --- Metrics extraction visitor ---
-static void metrics_visitor(const std::string &src, const std::string &name,
+static void metrics_visitor([[maybe_unused]] const std::string &src, const std::string &name,
                             TSNode fn_node, TSNode body_node, void *ctx) {
   auto *metrics = static_cast<std::vector<FunctionMetrics> *>(ctx);
 
@@ -795,6 +859,19 @@ std::vector<ExportedSymbol> extract_exports(const std::string &content,
             else if (std::strstr(type, "enum")) kind = "enum";
             else if (std::strstr(type, "trait")) kind = "trait";
             else if (std::strstr(type, "type")) kind = "type";
+            exports.push_back({name, kind, line});
+          }
+        }
+      }
+      // GDScript: check for @export annotation
+      if (ext == ".gd" && end > start) {
+        std::string text = content.substr(start, std::min((uint32_t)50, end - start));
+        if (text.find("@export") != std::string::npos || text.find("@Export") != std::string::npos) {
+          std::string name = find_name(content, child);
+          if (!name.empty()) {
+            std::string kind = "const";
+            if (std::strstr(type, "function")) kind = "function";
+            else if (std::strstr(type, "class")) kind = "class";
             exports.push_back({name, kind, line});
           }
         }

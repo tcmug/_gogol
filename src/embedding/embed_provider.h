@@ -1,9 +1,11 @@
-// embed_provider.h — Abstract embedding interface
-// LocalEmbedder loads model directly. RemoteEmbedder connects to daemon via socket.
-// get_embedder() tries daemon first, falls back to local.
+// embed_provider.h — Abstract embedding interface.
+// gogol is daemon-less: the embedder always loads the model in-process
+// (LocalEmbedder). get_embedder() builds a fresh one; get_shared_embedder()
+// returns a process-lifetime warm singleton (for the MCP server's many calls).
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -17,11 +19,18 @@ public:
     embed_documents_batch(const std::vector<std::string> &texts) = 0;
 };
 
-// Resolve embedder: try daemon socket first, fall back to local model load
+// Build a fresh in-process embedder (loads the GGUF; ~1-2s). One-shot CLI use.
 std::unique_ptr<EmbedProvider> get_embedder(const std::string &model_path);
+// With explicit per-model retrieval prefixes (from GlobalConfig). std::nullopt for a
+// prefix = AUTO-SELECT from the model architecture; a value overrides.
+std::unique_ptr<EmbedProvider> get_embedder(const std::string &model_path,
+                                            const std::optional<std::string> &query_prefix,
+                                            const std::optional<std::string> &document_prefix);
 
-// Check if daemon is running (can connect to socket)
-bool daemon_is_running();
-
-// Socket path
-std::string daemon_socket_path();
+// Process-lifetime warm singleton keyed by (model_path, prefixes): loads once,
+// stays resident across calls. Use in the long-lived MCP server so tool calls
+// don't reload the model each time. The reference is cache-owned. std::nullopt
+// prefixes auto-select from the model architecture.
+EmbedProvider &get_shared_embedder(const std::string &model_path,
+                                   const std::optional<std::string> &query_prefix = std::nullopt,
+                                   const std::optional<std::string> &document_prefix = std::nullopt);

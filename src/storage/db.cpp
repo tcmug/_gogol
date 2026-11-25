@@ -3,6 +3,11 @@
 #include <stdexcept>
 #include <string>
 
+// sqlite-vec is compiled statically (SQLITE_CORE). Declare its init and register
+// it as an auto-extension so every sqlite3 connection gains the vec0 KNN virtual
+// table without loadable-extension machinery.
+extern "C" int sqlite3_vec_init(sqlite3 *, char **, const sqlite3_api_routines *);
+
 namespace {
 
 // Build a std::runtime_error from a message + the connection's last error.
@@ -22,8 +27,16 @@ std::runtime_error db_error(const std::string &what, sqlite3 *db) {
 
 // --- Db ---------------------------------------------------------------------
 
-Db::Db(const std::string &path) {
-    int rc = sqlite3_open(path.c_str(), &db_);
+Db::Db(const std::string &path, bool read_only) {
+    // Register sqlite-vec once (process-wide) so every connection gets vec0.
+    static bool vec_registered = [] {
+        return sqlite3_auto_extension(reinterpret_cast<void (*)()>(sqlite3_vec_init)) == SQLITE_OK;
+    }();
+    (void)vec_registered;
+    int open_flags = read_only
+        ? (SQLITE_OPEN_READONLY)
+        : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    int rc = sqlite3_open_v2(path.c_str(), &db_, open_flags, nullptr);
     if (rc != SQLITE_OK) {
         // db_ may be non-null even on failure; capture the message then close.
         std::runtime_error err = db_error("failed to open database '" + path + "'", db_);
@@ -33,8 +46,18 @@ Db::Db(const std::string &path) {
         }
         throw err;
     }
+    read_only_ = read_only;
+    // Set the busy timeout FIRST, via the C API, before ANY statement runs —
+    // otherwise the first PRAGMA in apply_pragmas() (journal_mode=WAL, which needs
+    // a brief exclusive moment) can throw "database is locked" during a concurrent
+    // write, uncaught -> process terminate. With this, every subsequent statement
+    // (incl. the pragmas) waits out a transient lock instead of failing.
+    sqlite3_busy_timeout(db_, 10000);
     apply_pragmas();
-    ensure_schema();
+    // NOTE: schema is intentionally NOT created here. Db is a schema-agnostic
+    // connection primitive (WAL/PRAGMAs + RAII Stmt/Tx). Each store owns its
+    // schema: v1 SqliteBackend calls ensure_schema(); v2 Store applies its
+    // own. This lets multiple schemas share the primitive without collision.
 }
 
 Db::~Db() {
@@ -73,11 +96,24 @@ void Db::set_user_version(uint32_t version) {
 }
 
 void Db::apply_pragmas() {
-    // WAL for concurrent readers + single writer; FULL fsync for durability of
-    // precious (sole-copy) data; foreign_keys on for referential integrity.
+    if (read_only_) {
+        // Read-only connection: cannot (and must not) issue write-pragmas
+        // (journal_mode=WAL, synchronous, application_id all write). Only the
+        // read-safe ones. query_only hard-guarantees no writes slip through.
+        exec("PRAGMA busy_timeout = 5000");
+        exec("PRAGMA query_only = ON");
+        return;
+    }
+    // WAL for concurrent readers + single writer; foreign_keys on for referential integrity.
     exec("PRAGMA journal_mode = WAL");
-    exec("PRAGMA synchronous = FULL");
+    // NORMAL is safe with WAL (protects against app crash, not power loss during write).
+    // Much faster than FULL which fsyncs on every commit.
+    exec("PRAGMA synchronous = NORMAL");
     exec("PRAGMA foreign_keys = ON");
+    // Performance: larger cache (20MB vs 2MB default), memory-mapped I/O, temp tables in RAM
+    exec("PRAGMA cache_size = -20000");      // 20MB page cache
+    exec("PRAGMA mmap_size = 268435456");    // 256MB memory-mapped I/O
+    exec("PRAGMA temp_store = MEMORY");      // temp tables in RAM
     // Wait out a transient writer lock instead of failing with SQLITE_BUSY.
     // Read commands (calls/affected/metrics/explore) open the index DB directly
     // while the daemon may briefly hold the write lock during a reindex; without
@@ -89,8 +125,7 @@ void Db::apply_pragmas() {
 }
 
 void Db::ensure_schema() {
-    // Idempotent: all CREATE ... IF NOT EXISTS. Mirrors the schema in
-    // docs/design/storage-architecture.md.
+    // Idempotent: all CREATE ... IF NOT EXISTS.
     exec(R"SQL(
 CREATE TABLE IF NOT EXISTS entries(
   rowid INTEGER PRIMARY KEY,
@@ -194,6 +229,12 @@ void Db::Stmt::bind(int index, int64_t value) {
     }
 }
 
+void Db::Stmt::bind(int index, double value) {
+    if (sqlite3_bind_double(stmt_, index, value) != SQLITE_OK) {
+        throw db_error("bind double failed", db_.raw());
+    }
+}
+
 void Db::Stmt::bind(int index, const std::string &value) {
     // SQLITE_TRANSIENT: sqlite copies the bytes, so value need not outlive bind.
     if (sqlite3_bind_text(stmt_, index, value.c_str(),
@@ -230,6 +271,10 @@ int64_t Db::Stmt::column_int64(int col) {
     return sqlite3_column_int64(stmt_, col);
 }
 
+double Db::Stmt::column_double(int col) {
+    return sqlite3_column_double(stmt_, col);
+}
+
 std::string Db::Stmt::column_text(int col) {
     const unsigned char *txt = sqlite3_column_text(stmt_, col);
     if (!txt) {
@@ -237,6 +282,14 @@ std::string Db::Stmt::column_text(int col) {
     }
     int n = sqlite3_column_bytes(stmt_, col);
     return std::string(reinterpret_cast<const char *>(txt), static_cast<size_t>(n));
+}
+
+const void* Db::Stmt::column_blob(int col) {
+    return sqlite3_column_blob(stmt_, col);
+}
+
+int Db::Stmt::column_bytes(int col) {
+    return sqlite3_column_bytes(stmt_, col);
 }
 
 void Db::Stmt::reset() {

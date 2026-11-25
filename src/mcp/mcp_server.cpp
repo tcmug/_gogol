@@ -1,55 +1,95 @@
 // gogol MCP server — stdio JSON-RPC 2.0 implementation.
 //
 // Protocol glue only. The Tool Registry (mcp/tool_registry.h) is the single
-// source of truth for the tool catalog + param schema; execution reuses the
-// existing daemon RpcClient (daemon/embed_client.h). No search/graph logic is
+// source of truth for the tool catalog + param schema. No search/graph logic is
 // reimplemented here.
 //
-// Wiring status (P3):
-//   - query : WIRED  → RpcClient::cmd_query
-//   - get   : WIRED  → RpcClient::cmd_get
-//   - list  : WIRED  → RpcClient::cmd_list
-//   - calls    : WIRED → CallGraphQuery (reads stores via open_backend; no daemon)
-//   - affected : WIRED → import-graph BFS (open_backend; no daemon)
-//   - explore  : WIRED → definition lookup + source + callers/callees + imports +
-//                docrefs (open_backend); the semantic "related" section is added
-//                only when the daemon is up (best-effort, never fatal).
+// All exposed tools operate over the unified memory store (~/.gogol/cache.db +
+// notes.db); each handler reads/writes it directly (no daemon). The v1 index-backed
+// tools (query/read/list/affected/metrics/write/rm/move) were retired and their
+// handlers removed — the v1 stores are migrated into the v2 memory.
 #include "mcp/mcp_server.h"
 
-#include <fnmatch.h>
-
+#include <filesystem>
 #include <functional>
 #include <iostream>
-#include <map>
-#include <queue>
-#include <set>
 #include <string>
-#include <tuple>
 #include <unordered_map>
 #include <vector>
+#include <chrono>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
-#include "adapters/file_adapter.h"
+#include <unistd.h>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include "config/config.h"
-#include "config/utils.h"
-#include "core/call_graph_query.h"
-#include "core/format.h"
-#include "core/loc.h"
-#include "core/operations.h"
-#include "daemon/embed_client.h"
-#include "daemon/rpc.h"
+#include "embedding/embed_provider.h"
+#include "core/refresh.h"      // gogol::refresh_repo, kMcpInlineRefreshBudgetMs
+#include "core/result_formatters.h"  // gogol::format_recall_results
+#include "cli/git_identity.h"        // gogol::resolve_git_identity
 #include "mcp/json.h"
+#include "mcp/daemon_lock.h"   // DaemonLock (singleton flock)
+#include "mcp/unix_server.h"   // run_unix_socket_server
+#include "mcp/stdio_shim.h"    // run_stdio_shim
 #include "mcp/tool_registry.h"
-#include "storage/call_store.h"
-#include "storage/docref_store.h"
-#include "storage/import_store.h"
-#include "storage/index_file.h"
-#include "storage/metrics_store.h"
-#include "storage/storage_backend.h"
+#include "mcp/message_bus.h"
+#include "store/store.h"
 
 namespace gogol {
 namespace mcp {
 
+// --- spillover thread tracking ---
+// Background refresh threads (MCP inline-refresh budget spillover) are TRACKED,
+// not detached, so we can join them before the process exits. A detached thread
+// still holding a llama/ggml Metal context at exit() trips the Metal backend's
+// static-teardown assert (ggml_metal_device_free expects 0 outstanding sets);
+// joining first guarantees no thread owns a Metal context during shutdown.
 namespace {
+std::mutex g_spillover_mu;
+std::vector<std::thread> g_spillover_threads;
+
+void track_spillover(std::thread t) {
+    std::lock_guard<std::mutex> lk(g_spillover_mu);
+    g_spillover_threads.push_back(std::move(t));
+}
+
+void join_spillover_threads() {
+    std::vector<std::thread> pending;
+    {
+        std::lock_guard<std::mutex> lk(g_spillover_mu);
+        pending.swap(g_spillover_threads);
+    }
+    for (auto &t : pending)
+        if (t.joinable()) t.join();
+}
+}  // namespace
+
+namespace {
+
+// The MCP transport is JSON-RPC over stdout: ONLY framed JSON may hit fd 1, or the
+// client closes the connection ("non-JSON-RPC output to stdout"). But loading the
+// embedder in-process runs llama.cpp/ggml backend init, which can write device/
+// backend lines DIRECTLY to stdout (bypassing llama_log_set). StdoutGuard redirects
+// fd 1 -> fd 2 (stderr) for its lifetime, so any such stray bytes go to stderr and
+// never corrupt the JSON-RPC stream. Wrap embedder acquisition / embed calls in it.
+// INVARIANT §5 (docs/INVARIANTS.md): ggml logs to raw stdout, bypassing llama_log_set.
+struct StdoutGuard {
+    int saved = -1;
+    StdoutGuard() {
+        std::fflush(stdout);
+        saved = ::dup(1);
+        ::dup2(2, 1);              // point stdout at stderr
+    }
+    ~StdoutGuard() {
+        std::fflush(stdout);
+        if (saved >= 0) { ::dup2(saved, 1); ::close(saved); }  // restore real stdout
+    }
+    StdoutGuard(const StdoutGuard&) = delete;
+    StdoutGuard& operator=(const StdoutGuard&) = delete;
+};
 
 // JSON-RPC 2.0 standard error codes.
 constexpr int kParseError = -32700;
@@ -71,21 +111,18 @@ const char* kInstructions =
     "`explore` (signature + source + callers + callees + imports in one call); "
     "to find code by concept/meaning use `query`; to trace call chains use "
     "`calls`; for the blast radius of a change use `affected`; to read a known "
-    "location use `get`; to see what an index holds use `list`.\n\n"
-    "Core workflow rule: after `query` returns a hit, `get` or `explore` that "
+    "location use `read`; to see what an index holds use `list`.\n\n"
+    "Core workflow rule: after `query` returns a hit, `read` or `explore` that "
     "exact location \xE2\x80\x94 do NOT re-query with reworded terms (two queries "
     "max, then switch tools). Prefer `explore` over `query` whenever you already "
     "know the symbol name.\n\n"
     "Details: every entry is `<type> <index> <path>` \xE2\x80\x94 type is `doc` "
     "(a file chunk), `note` (a memory note), or `term` (a glossary term). "
-    "Results lead with `type index path:line`, directly reusable as `get`/"
-    "`explore` input. Pass `index` inline on each call to scope it (one field, "
-    "no extra call); omit it to search all indexes. (Optional: for a long run "
-    "against one index, `set_scope` once sets a default so you can omit `index` "
-    "\xE2\x80\x94 skip it otherwise, inline `index` is simpler.) `affected` "
+    "Results lead with `type index path:line`, directly reusable as `read`/"
+    "`explore` input. Pass `index` inline on each call to scope it; omit it to "
+    "search all indexes. `affected` "
     "returning 0 usually means the file is an entry point that nothing imports "
-    "(usually correct, not an error). `add_note`/`add_term` persist reusable "
-    "findings.";
+    "(usually correct, not an error). `write` persists reusable findings.";
 
 // Build a JSON-RPC success envelope: {jsonrpc, id, result}.
 Json make_response(const Json& id, Json result) {
@@ -130,717 +167,623 @@ Json wrap_tool_result(const ToolResult& tr) {
     return result;
 }
 
-// --- Handlers: reuse the existing daemon RpcClient; never reimplement search/
-// graph logic. Bound to tool names ONCE in tool_dispatch() below — the single
-// dispatch site. The registry (tool_registry.cpp) owns the catalog + schema;
-// this file owns execution (it legitimately depends on RpcClient, which the
-// daemon-free registry TU must not).
-
-ToolResult handle_query(const ToolArgs& a, Session& s) {
-    RpcClient rpc;
-    if (!rpc.connected())
-        return ToolResult::fail("No gogol daemon running. Start it with: gogol serve");
-    QueryRequest req;
-    req.query = a.get_str("text");
-    req.index = a.has("index") ? a.get_str("index") : s.default_index;
-    req.type_filter = -1;
-    std::string type_tok = a.has("type") ? a.get_str("type") : s.default_type;
-    if (!type_tok.empty()) { EntryType et; if (parse_entry_type(type_tok, et)) req.type_filter = (int)et; }
-    req.top_k = a.has("limit") ? (int)a.get_int("limit") : 5;
-    if (req.top_k <= 0) req.top_k = 5;
-    req.show_lines = 0; req.scores = true;
-    std::vector<QueryResultEntry> results;
-    std::string err = rpc.cmd_query(req, results);
-    if (!err.empty()) return ToolResult::fail(err);
-    Json arr = Json::array();
-    for (const auto& r : results) {
-        Json e = Json::object();
-        e["index"]=r.index; e["path"]=r.path; e["line"]=r.line; e["chunk"]=r.chunk;
-        e["proto"]=r.proto; e["type"]=(r.proto==1?"note":r.proto==2?"term":"doc");
-        e["status"]=r.status; e["score"]=r.score; e["cosine"]=r.cosine;
-        if (!r.snippet.empty()) e["snippet"]=r.snippet;
-        arr.push_back(std::move(e));
-    }
-    Json out = Json::object(); out["results"]=std::move(arr); out["count"]=results.size();
-    // Cache the hit list so a follow-up `get result N` (or explore) can resolve
-    // a cursor without re-querying (P4 result cursors).
-    s.set_last_results(out["results"]);
-    return ToolResult::ok(std::move(out));
+// --- Unified memory store. Reads ~/.gogol/cache.db + notes.db directly (no
+// daemon); embeds the query via get_embedder. Cross-index hybrid retrieval:
+// semantic top-k + call-graph edge expansion. ---
+static std::string cache_db_path_mcp() {
+    return cache_db_path();
+}
+static std::string notes_db_path_mcp() {
+    return notes_db_path();
 }
 
-ToolResult handle_get(const ToolArgs& a, Session& s) {
-    RpcClient rpc;
-    if (!rpc.connected())
-        return ToolResult::fail("No gogol daemon running. Start it with: gogol serve");
+// Resolve the embedding model path WITHOUT exiting (unlike cli resolve_model):
+// env override, else global config.
+static std::string resolve_model_path() {
+    if (const char* env = std::getenv("GOGOL_MODEL")) return env;
+    auto gc = load_global_config();
+    if (!gc.model.empty()) return gc.model;
+    // Convention fallback: gogol_home()/model symlink, if present.
+    std::error_code ec;
+    std::string mp = model_path();
+    if (std::filesystem::exists(mp, ec) && !ec) return mp;
+    return gc.model;  // empty -> caller reports "model not found"
+}
 
-    // Optional result-cursor shortcut: `result: N` resolves the type/index/path
-    // (and line) from the last query/calls hit list, so the agent can do
-    // query → get {result:0} without re-typing the location. Explicit
-    // type/index/path args still win over the cursor.
-    std::string type_tok = a.get_str("type");
-    std::string index = a.has("index") ? a.get_str("index") : s.default_index;
-    std::string path = a.get_str("path");
-    if (a.has("result")) {
-        ResultRef ref = s.result_ref(a.get_int("result"));
-        if (!ref.valid)
-            return ToolResult::fail("no cached result at index " +
-                                    std::to_string(a.get_int("result")) +
-                                    " — run query/calls first");
-        if (type_tok.empty()) type_tok = ref.type.empty() ? "doc" : ref.type;
-        if (index.empty()) index = ref.index;
-        if (path.empty()) {
-            path = ref.path;
-            if (ref.line > 0) path += ":" + std::to_string(ref.line);
+// The MCP server is long-lived and handles many tool calls in one process, so the
+// model must load ONCE and stay warm — get_shared_embedder returns a process-lifetime
+// singleton (keyed by model+prefixes). Returns nullptr only if no model path is set.
+static EmbedProvider* get_embedder_cfg() {
+    auto gc = load_global_config();
+    std::string mp = gc.model;
+    if (const char* env = std::getenv("GOGOL_MODEL")) mp = env;
+    if (mp.empty()) return nullptr;
+    return &get_shared_embedder(mp, gc.query_prefix, gc.document_prefix);
+}
+
+ToolResult handle_store_query(const ToolArgs& a) {
+    std::string text = a.get_str("text");
+    if (text.empty()) return ToolResult::fail("missing required parameter: text");
+    std::string dbp = cache_db_path_mcp();
+    EmbedProvider* embedder = nullptr;
+    std::vector<float> q;
+    {
+        StdoutGuard guard;  // llama/ggml init + encode may write to stdout — keep it off the JSON-RPC stream
+        embedder = get_embedder_cfg();
+        if (embedder) q = embedder->embed_query(text);
+    }
+    if (!embedder) return ToolResult::fail("could not load embedder");
+
+    // MCP on-demand refresh (inline_refresh model): if `scope` is a git repo
+    // path, refresh its changed files INLINE with a ~5s budget so fresh edits show in
+    // THIS response; if the budget is hit (unfinished work remains), finish the rest on
+    // a DETACHED background thread so the call stays responsive. `indexing` in the
+    // response signals a spillover is still running. No repo resolvable => skip refresh.
+    // This runs BEFORE the store-existence check so a COLD store (no cache.db yet) is
+    // created + populated by the refresh — the first recall on a fresh repo indexes it.
+    bool indexing = false;
+    {
+        std::string scope = a.get_str("scope");
+        std::string repo, idx;
+        if (!scope.empty()) {
+            auto gid = gogol::resolve_git_identity(scope);
+            if (gid && !gid->toplevel.empty()) { repo = gid->toplevel; idx = gid->common_dir; }
+        }
+        if (!repo.empty()) {
+            gogol::IngestResult ir;
+            {
+                StdoutGuard guard;  // embed_document during refresh may hit stdout
+                // Inline pass owns its OWN writable store handle (the query store below
+                // is read-only); shares the process embedder. Connections run on their
+                // own threads, so concurrent llama use is prevented by Embedder's mutex
+                // (NOT by a single-threaded request loop — there isn't one).
+                store::Store rw(dbp, notes_db_path_mcp());
+                auto deadline = std::chrono::steady_clock::now() + gogol::kMcpInlineRefreshBudgetMs;
+                ir = gogol::refresh_repo(rw, *embedder, repo, idx, deadline);
+            }
+            if (ir.ok && ir.hit_budget) {
+                indexing = true;
+                // Spillover: finish the refresh unbounded on a detached thread. It owns
+                // its OWN Store (own SQLite connection; WAL + busy_timeout serialize
+                // the one writer) AND its OWN fresh embedder (own llama context — NOT the
+                // shared one the request loop uses, so no concurrent-context race). The
+                // body is wrapped in try/catch: llama.cpp installs a std::set_terminate
+                // -> abort(), so an uncaught exception would kill the whole MCP process.
+                std::string model = resolve_model_path();
+                track_spillover(std::thread([dbp, notes = notes_db_path_mcp(), repo, idx, model]() {
+                    try {
+                        auto gc = load_global_config();
+                        auto emb = get_embedder(model, gc.query_prefix, gc.document_prefix);
+                        if (!emb) return;
+                        store::Store rw(dbp, notes);
+                        gogol::refresh_repo(rw, *emb, repo, idx);  // no deadline => finish it
+                    } catch (...) {
+                        // swallow: a failed background refresh must not abort the process;
+                        // the next query's inline pass will pick up whatever is unfinished.
+                    }
+                }));  // tracked (not detached): joined before process exit so no
+                      // spillover thread holds a Metal context during static teardown.
+            }
         }
     }
 
-    if (type_tok.empty())
-        return ToolResult::fail(
-            "get needs a location: pass type+index+path, or `result: N` (a "
-            "0-based index into the last query/calls/explore results). "
-            "Each query/explore hit already carries type/index/path — pass "
-            "those, or `result: 0` for the first hit.");
-    if (index.empty())
-        return ToolResult::fail("missing required parameter: index (or a `result` cursor)");
-    if (path.empty())
-        return ToolResult::fail("missing required parameter: path (or a `result` cursor)");
+    // After a possible refresh, the store must exist. If it still doesn't (no scope /
+    // not a repo AND no prior store), there is nothing to search.
+    std::error_code ec;
+    if (!std::filesystem::exists(dbp, ec) || ec)
+        return ToolResult::fail("v2 memory store not found at " + dbp +
+                                " (pass scope=<a git repo path> to index it)");
 
-    EntryType et;
-    if (!parse_entry_type(type_tok, et))
-        return ToolResult::fail("invalid type: expected doc | note | term");
-    EntryRef ref; ref.type=et; ref.index=index; ref.path=path;
-    int max_lines = a.has("lines") ? (int)a.get_int("lines") : 0;
-    std::string content = rpc.cmd_get(ref, max_lines);
-    if (content.empty())
-        return ToolResult::fail("not found or empty: " + type_tok + " " + ref.index + " " + ref.path);
-    Json out = Json::object();
-    out["type"]=type_tok; out["index"]=ref.index; out["path"]=ref.path; out["content"]=content;
+    store::Store store(dbp, notes_db_path_mcp(), store::Store::ReadOnly{});
+    int k = a.has("limit") ? static_cast<int>(a.get_int("limit")) : 10;
+    if (k <= 0) k = 10;
+    std::string rtype = a.get_str("type");   // optional: filter note|doc|code
+    // Recall scope resolution (shared with CLI via gogol::resolve_recall_scope). MCP has
+    // no CWD (cwd left empty -> no default-scope fallback; a bare non-git `scope` dir
+    // becomes a parent-dir search instead).
+    auto known = store.index_locations();
+    gogol::RecallScopeInputs in;
+    in.ref = a.get_str("ref");          // portable root-SHA identity
+    in.scope = a.get_str("scope");      // path / repo name / dir
+    in.scope_set = !in.scope.empty();
+    // in.cwd stays empty — the MCP server has no meaningful CWD.
+    auto rsc = gogol::resolve_recall_scope(in, known);
+    if (!rsc.error.empty()) return ToolResult::fail(rsc.error);
+
+    std::vector<std::string> restrict_refs =
+        store.recall_restrict_refs(rsc.parent_dir, rsc.scoped);
+    std::string source_prefix = rsc.source_prefix;
+    if (!restrict_refs.empty()) source_prefix.clear();
+    auto hits = store.query_hybrid(q, k, rsc.idx, rtype, rsc.note_scope, text, source_prefix, restrict_refs);  // cosine+FTS A3 blend; idx+type PRE-filtered; notes scope-filtered
+    
+    // Compute the best cosine across all non-edge hits for global confidence flag
+    float global_max_cosine = 0.0f;
+    for (const auto& h : hits) {
+        if (!h.via_edge && h.max_cosine > global_max_cosine)
+            global_max_cosine = h.max_cosine;
+    }
+    // Use unified formatter for consistent CLI + MCP output
+    auto formatted = gogol::format_recall_results(hits, store, global_max_cosine);
+    Json out = formatted.to_json();
+    
+    // Add indexing status: true only when background refresh still running
+    if (indexing) out["indexing"] = true;
+    
     return ToolResult::ok(std::move(out));
+
 }
 
-ToolResult handle_list(const ToolArgs& a, Session& s) {
-    RpcClient rpc;
-    if (!rpc.connected())
-        return ToolResult::fail("No gogol daemon running. Start it with: gogol serve");
-    std::string index = a.has("index") ? a.get_str("index") : s.default_index;
+// Forward decl: the message bus singleton is defined below, but status reads it.
+static MessageBus& message_bus();
 
-    // No index specified → return an OVERVIEW of available indexes (name +
-    // entry counts), NOT an empty list. The daemon's LIST needs a specific
-    // index; without this branch, `list {}` returned {count:0} and misled the
-    // agent into thinking gogol was empty. Mirrors the CLI, which refuses
-    // list-without-index and points at `status`.
-    if (index.empty()) {
-        Json indexes = Json::array();
-        size_t total = 0;
-        for (auto& [name, cfg] : load_config()) {
-            if (!cfg.is_indexed()) continue;
-            IndexCounts c = open_backend(name)->load_index_counts();
-            Json ji = Json::object();
-            ji["index"] = name;
-            ji["docs"] = c.file_count;
-            ji["notes"] = c.mem_count;
-            indexes.push_back(std::move(ji));
-            total += c.file_count + c.mem_count;
-        }
+// `[mcp] messaging` (agent messaging over MCP). Read from config once per process, like
+// the rest of the daemon's config; set_messaging_override pins it (tests).
+static int g_messaging_override = -1;  // -1 = read config, 0/1 = pinned
+static bool messaging_enabled() {
+    if (g_messaging_override >= 0) return g_messaging_override == 1;
+    static const bool from_config = load_global_config().messaging;
+    return from_config;
+}
+
+ToolResult handle_store_stats(const ToolArgs&) {
+    Json wrapped = Json::object();
+    // Store section: present only if the cache.db exists (bus stats work even cold).
+    std::string dbp = cache_db_path_mcp();
+    std::error_code ec;
+    if (std::filesystem::exists(dbp, ec) && !ec) {
+        store::Store store(dbp, notes_db_path_mcp(), store::Store::ReadOnly{});
+        auto s = store.stats();
         Json out = Json::object();
-        size_t n_indexes = indexes.size();
-        out["indexes"] = std::move(indexes);
-        out["index_count"] = n_indexes;
-        out["total_entries"] = total;
-        out["hint"] = "No index specified — this is an overview. Call list with "
-                      "an `index` (or query/explore with one) to work inside a "
-                      "specific index.";
-        return ToolResult::ok(std::move(out));
+        out["entries"] = static_cast<long>(s.entries);
+        out["vec_entries"] = static_cast<long>(s.vec_entries);
+        out["edges"] = static_cast<long>(s.edges);
+        out["indexes"] = static_cast<long>(s.indexes);
+        out["notes"] = static_cast<long>(store.count_by_type("note"));
+        out["path"] = dbp;
+        // Per-index breakdown: each index's portable ref (root_sha), on-disk checkout
+        // dir(s), overlay flag, and entry count. root_sha is the token to pass as `scope`/
+        // `ref` from a machine with no shared filesystem.
+        Json ix = Json::array();
+        for (const auto &info : store.index_breakdown()) {
+            Json o = Json::object();
+            o["idx"] = info.idx;
+            if (!info.root_sha.empty()) o["root_sha"] = info.root_sha;
+            o["entries"] = static_cast<long>(info.entries);
+            Json dirs = Json::array();
+            for (const auto &d : info.dirs) {
+                Json dj = Json::object();
+                dj["dir"] = d.path;
+                dj["overlay"] = d.overlay;
+                dirs.push_back(std::move(dj));
+            }
+            o["dirs"] = std::move(dirs);
+            ix.push_back(std::move(o));
+        }
+        out["index_list"] = std::move(ix);
+        wrapped["store"] = std::move(out);
     }
 
-    bool has_type = false; EntryType et = EntryType::DOC;
-    std::string type_tok = a.has("type") ? a.get_str("type") : s.default_type;
-    if (!type_tok.empty()) {
-        if (!parse_entry_type(type_tok, et)) return ToolResult::fail("invalid type: expected doc | note | term");
-        has_type = true;
+    // Bus section: combadge agent message bus observability (always present).
+    BusStats bs = message_bus().stats();
+    Json bus = Json::object();
+    bus["agents"] = bs.agents;
+    bus["online"] = bs.online;
+    bus["total_sent"] = bs.total_sent;
+    bus["queued"] = bs.queued;
+    Json agents = Json::array();
+    for (const auto& r : bs.rows) {
+        Json a = Json::object();
+        a["name"] = r.name;
+        a["online"] = r.online;
+        a["inbox_depth"] = r.inbox_depth;
+        a["sent"] = r.sent;
+        a["received"] = r.received;
+        a["last_seen"] = r.last_seen;
+        agents.push_back(std::move(a));
     }
-    std::vector<ListResultEntry> entries;
-    std::string err = rpc.cmd_list(et, has_type, index, entries);
-    if (!err.empty()) return ToolResult::fail(err);
-    Json arr = Json::array();
-    for (const auto& e : entries) {
-        Json j = Json::object();
-        j["proto"]=e.proto; j["type"]=(e.proto==1?"note":e.proto==2?"term":"doc");
-        j["index"]=e.index; j["path"]=e.path; j["line"]=e.line;
-        if (!e.chunk.empty()) j["chunk"]=e.chunk;
-        arr.push_back(std::move(j));
-    }
-    Json out = Json::object(); out["entries"]=std::move(arr); out["count"]=entries.size();
-    return ToolResult::ok(std::move(out));
+    bus["agents_list"] = std::move(agents);
+    wrapped["bus"] = std::move(bus);
+
+    return ToolResult::ok(std::move(wrapped));
 }
 
-// --- calls: reuse CallGraphQuery (find_callers/find_callees). Reads stores via
-// open_backend, so it works with NO daemon. Mirrors cmd_calls's recursive
-// print_tree walk, but emits JSON edge lists instead of text.
-Json edge_to_json(const Edge& e) {
+// --- combadge agent message bus (shared across all serve threads) ---
+// Process-global: gogol serve is thread-per-connection, so a blocked `receive` parks
+// its own thread on the bus's per-name condvar. The daemon (cmd_serve) points the bus
+// at messages.db before first use so queued messages survive a restart (ADR-003).
+// Any other process (the in-process stdio fallback) gets a private in-memory bus: it
+// cannot share wakeups with the daemon, so sharing its file would only mislead.
+static std::string g_bus_db_path = ":memory:";
+
+static MessageBus& message_bus() {
+    static MessageBus& bus = []() -> MessageBus& {
+        try {
+            return *new MessageBus(g_bus_db_path);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "gogol: cannot open message store %s (%s); bus is in-memory.\n",
+                    g_bus_db_path.c_str(), e.what());
+            return *new MessageBus();
+        }
+    }();
+    return bus;
+}
+
+static Json bus_msg_json(const BusMsg& m) {
     Json j = Json::object();
-    j["name"] = e.name;
-    j["file"] = e.file;
-    j["index"] = e.index;
-    j["line"] = e.line;
+    j["seq"] = m.seq;
+    j["from"] = m.from;
+    j["body"] = m.body;
+    j["ts"] = m.ts;
     return j;
 }
 
-// Collect edges recursively (depth>1), same visited-set + walk shape as
-// cmd_calls's print_tree, producing a flat JSON array.
-void collect_edges_recursive(CallGraphQuery& cg, const std::string& name, int level,
-                             int depth, bool is_caller, std::set<std::string>& visited,
-                             Json& out) {
-    auto edges = is_caller ? cg.find_callers(name) : cg.find_callees(name);
-    for (const auto& e : edges) {
-        if (visited.count(e.name)) continue;
-        visited.insert(e.name);
-        Json j = edge_to_json(e);
-        j["depth"] = level;
-        out.push_back(std::move(j));
-        if (level < depth)
-            collect_edges_recursive(cg, e.name, level + 1, depth, is_caller, visited, out);
-    }
-}
+ToolResult handle_msg_send(const ToolArgs& a) {
+    std::string to = a.get_str("to");
+    if (to.empty()) return ToolResult::fail("missing required parameter: to");
+    // `me` (the handle from listen) wins over `from`: a client that injects `me` decides
+    // who the sender is, whatever the model put in `from`.
+    std::string from = a.get_str("me");
+    if (from.empty()) from = a.get_str("from", "anon");
+    std::string body = a.get_str("body");
 
-ToolResult handle_calls(const ToolArgs& a, Session& s) {
-    std::string name = a.get_str("name");
-    if (name.empty()) return ToolResult::fail("missing required parameter: name");
-
-    std::vector<std::string> index_names;
-    std::string idx = a.has("index") ? a.get_str("index") : s.default_index;
-    if (!idx.empty()) {
-        index_names = split_csv(idx);
-    } else {
-        for (auto& [n, cfg] : load_config())
-            if (cfg.is_indexed()) index_names.push_back(n);
+    // Selling point: semantic-context-on-send. Attach recall hits for the body so the
+    // recipient arrives pre-loaded and skips its own search turns. Reuses the SAME
+    // recall path (handle_store_query) scoped by ref (portable, no shared fs needed).
+    Json context;
+    bool have_context = false;
+    if (a.get_bool("with_context")) {
+        long climit = a.has("context_limit") ? a.get_int("context_limit") : 5;
+        if (climit <= 0) climit = 5;
+        Json qargs = Json::object();
+        qargs["text"] = body;
+        qargs["limit"] = climit;
+        if (a.has("ref")) qargs["ref"] = a.get_str("ref");
+        ToolArgs qa{std::move(qargs)};
+        ToolResult qr = handle_store_query(qa);
+        if (!qr.is_error) { context = std::move(qr.content); have_context = true; }
+        // A failed recall (no store/embedder) must NOT block delivery — send anyway,
+        // just without context. The message is the point; context is a bonus.
     }
 
-    CallGraphQuery cg;
-    cg.load(index_names, /*verbose=*/false);
-
-    int depth = a.has("depth") ? (int)a.get_int("depth") : 1;
-    if (depth < 1) depth = 1;
-
-    std::string direction = a.get_str("direction");  // "in" | "out" | ""
-    bool want_callers = (direction != "out");
-    bool want_callees = (direction != "in");
-
-    Json callers = Json::array();
-    Json callees = Json::array();
-
-    if (want_callers) {
-        if (depth > 1) {
-            std::set<std::string> visited; visited.insert(name);
-            collect_edges_recursive(cg, name, 1, depth, /*is_caller=*/true, visited, callers);
-        } else {
-            for (const auto& e : cg.find_callers(name)) callers.push_back(edge_to_json(e));
-        }
-    }
-    if (want_callees) {
-        if (depth > 1) {
-            std::set<std::string> visited; visited.insert(name);
-            collect_edges_recursive(cg, name, 1, depth, /*is_caller=*/false, visited, callees);
-        } else {
-            for (const auto& e : cg.find_callees(name)) callees.push_back(edge_to_json(e));
-        }
-    }
-
+    SendOutcome s = message_bus().send(to, from, body);
     Json out = Json::object();
-    out["name"] = name;
-    out["callers"] = std::move(callers);
-    out["callees"] = std::move(callees);
-    out["count_callers"] = out["callers"].size();
-    out["count_callees"] = out["callees"].size();
-
-    // Cache a flat, get-compatible cursor list (callers then callees). Each edge
-    // becomes {type:"doc", index, path:<file>, line, name} so a follow-up
-    // `get result N` resolves an edge's location without re-querying.
-    Json cursors = Json::array();
-    auto push_edges = [&](const Json& edges) {
-        if (!edges.is_array()) return;
-        for (const auto& e : edges) {
-            if (!e.is_object()) continue;
-            Json c = Json::object();
-            c["type"] = "doc";
-            auto get_s = [&](const char* k) {
-                auto it = e.find(k);
-                return (it != e.end() && it->is_string()) ? it->get<std::string>() : std::string();
-            };
-            c["index"] = get_s("index");
-            c["path"] = get_s("file");
-            c["name"] = get_s("name");
-            auto lit = e.find("line");
-            if (lit != e.end() && lit->is_number_integer()) c["line"] = lit->get<long>();
-            cursors.push_back(std::move(c));
-        }
-    };
-    push_edges(out["callers"]);
-    push_edges(out["callees"]);
-    s.set_last_results(cursors);
-
+    out["seq"] = s.seq;
+    out["delivered_live"] = s.delivered_live;
+    out["queued_depth"] = s.queued_depth;
+    out["your_inbox"] = s.your_inbox;
+    if (have_context) out["context"] = std::move(context);
     return ToolResult::ok(std::move(out));
 }
 
-// --- affected: reuse cmd_affected's import-graph BFS (open_backend; no daemon).
-// Same FIXED seed-matching (exact / path-suffix, never bare substring) and the
-// barrel-fan-in guard, producing a JSON list of "index:path" dependents.
-ToolResult handle_affected(const ToolArgs& a, Session& s) {
-    // files: required array of strings.
-    std::vector<std::string> input_files;
-    if (a.obj.is_object()) {
-        auto it = a.obj.find("files");
-        if (it != a.obj.end() && it->is_array()) {
+// listen: claim an agent name for messaging over MCP. Stateless (SEP-2567 handle pattern):
+// nothing is stored per connection; the returned `me` is the handle the caller passes back.
+// Marks the name online so senders see delivered_live, and reports the current backlog.
+ToolResult handle_msg_listen(const ToolArgs& a) {
+    std::string name = a.get_str("name");
+    if (name.empty()) return ToolResult::fail("missing required parameter: name");
+    message_bus().set_online(name, true);
+    Json out = Json::object();
+    out["me"] = name;
+    out["unread"] = static_cast<long>(message_bus().peek(name).messages.size());
+    out["hint"] = "Pass me=\"" + name + "\" on later gogol calls to send as this name "
+                  "and to be told when messages are waiting.";
+    return ToolResult::ok(std::move(out));
+}
+
+ToolResult handle_msg_receive(const ToolArgs& a) {
+    std::string me = a.get_str("me");
+    if (me.empty()) return ToolResult::fail("missing required parameter: me");
+    long timeout_ms = a.has("timeout_ms") ? a.get_int("timeout_ms") : 0;
+    bool consume = a.has("consume") ? a.get_bool("consume") : true;
+    std::string session = a.get_str("session");
+    ReceiveOutcome r = message_bus().receive(me, timeout_ms, consume, 300000, session);
+    Json msgs = Json::array();
+    for (const BusMsg& m : r.messages) msgs.push_back(bus_msg_json(m));
+    Json out = Json::object();
+    out["messages"] = std::move(msgs);
+    out["timed_out"] = r.timed_out;
+    return ToolResult::ok(std::move(out));
+}
+
+// ack: confirm the listed seqs (claimed via a session receive) were handled, so they
+// are never redelivered. Unknown, foreign or already-acked seqs are ignored.
+ToolResult handle_msg_ack(const ToolArgs& a) {
+    std::string me = a.get_str("me");
+    if (me.empty()) return ToolResult::fail("missing required parameter: me");
+    std::vector<int64_t> seqs;
+    auto it = a.obj.find("seq");
+    if (it != a.obj.end()) {
+        if (it->is_number_integer()) seqs.push_back(it->get<int64_t>());
+        else if (it->is_array())
             for (const auto& v : *it)
-                if (v.is_string()) input_files.push_back(v.get<std::string>());
-        } else if (it != a.obj.end() && it->is_string()) {
-            input_files.push_back(it->get<std::string>());
-        }
+                if (v.is_number_integer()) seqs.push_back(v.get<int64_t>());
     }
-    if (input_files.empty())
-        return ToolResult::fail("missing required parameter: files (array of file paths)");
-
-    auto configs = load_config();
-    std::vector<std::string> index_names;
-    std::string idx = a.has("index") ? a.get_str("index") : s.default_index;
-    if (!idx.empty()) {
-        index_names = split_csv(idx);
-    } else {
-        for (auto& [n, cfg] : configs)
-            if (cfg.is_indexed()) index_names.push_back(n);
-    }
-
-    int max_depth = a.has("depth") ? (int)a.get_int("depth") : 0;
-    if (max_depth <= 0) max_depth = 5;
-    std::string filter = a.get_str("filter");
-
-    std::map<std::string, ImportGraph> graphs;
-    for (auto& idx_name : index_names)
-        graphs[idx_name] = open_backend(idx_name)->load_import_graph();
-
-    // Resolve seeds (index, relative_path) — mirrors cmd_affected exactly.
-    std::vector<std::pair<std::string, std::string>> seed_files;
-    for (auto& input : input_files) {
-        auto colon = input.find(':');
-        if (colon != std::string::npos && colon > 0 && input[0] != '/' && input[0] != '.') {
-            std::string ix = input.substr(0, colon);
-            std::string rel = input.substr(colon + 1);
-            if (graphs.count(ix)) { seed_files.push_back({ix, rel}); continue; }
-        }
-        bool found = false;
-        for (auto& [idx_name, graph] : graphs) {
-            for (auto& [file, _] : graph.imports) {
-                bool exact = (file == input);
-                bool suffix = (input.find('/') == std::string::npos)
-                    ? (file.size() > input.size() &&
-                       file.compare(file.size() - input.size() - 1, input.size() + 1,
-                                    "/" + input) == 0)
-                    : (file.size() >= input.size() &&
-                       file.compare(file.size() - input.size(), input.size(), input) == 0 &&
-                       (file.size() == input.size() || file[file.size() - input.size() - 1] == '/'));
-                if (exact || suffix) { seed_files.push_back({idx_name, file}); found = true; break; }
-            }
-        }
-        if (!found)
-            for (auto& [idx_name, graph] : graphs)
-                seed_files.push_back({idx_name, input});
-    }
-
-    std::set<std::string> visited, affected;
-    std::queue<std::tuple<std::string, std::string, int>> queue;
-    for (auto& [ix, file] : seed_files) {
-        std::string key = ix + ":" + file;
-        if (visited.count(key)) continue;
-        visited.insert(key);
-        queue.push({ix, file, 0});
-    }
-
-    const size_t BARREL_FANIN = 40;
-    while (!queue.empty()) {
-        auto [idx_name, file, depth] = queue.front();
-        queue.pop();
-        if (depth >= max_depth) continue;
-        if (!graphs.count(idx_name)) continue;
-        auto& graph = graphs[idx_name];
-        auto importers = graph.imported_by(file);
-        if (depth > 0 && importers.size() > BARREL_FANIN) continue;
-        for (auto& importer : importers) {
-            std::string key = idx_name + ":" + importer;
-            if (visited.count(key)) continue;
-            visited.insert(key);
-            affected.insert(key);
-            queue.push({idx_name, importer, depth + 1});
-        }
-    }
-
-    Json arr = Json::array();
-    for (auto& entry : affected) {
-        auto colon = entry.find(':');
-        std::string file = entry.substr(colon + 1);
-        if (!filter.empty() && fnmatch(filter.c_str(), file.c_str(), 0) != 0) continue;
-        arr.push_back(entry);
-    }
-
+    if (seqs.empty()) return ToolResult::fail("missing required parameter: seq");
     Json out = Json::object();
-    out["affected"] = std::move(arr);
-    out["count"] = out["affected"].size();
+    out["acked"] = message_bus().ack(me, seqs);
     return ToolResult::ok(std::move(out));
 }
 
-// --- explore: reuse cmd_explore's core (open_backend index lookup + call graph
-// + metrics fallback) to BUILD a JSON deep-dive rather than printing. Sections:
-// definition (index/file/line/end_line/func_lines), source snippet, callers,
-// callees (project-only), imports, docrefs, and best-effort related (daemon).
-ToolResult handle_explore(const ToolArgs& a, Session& s) {
+ToolResult handle_msg_peek(const ToolArgs& a) {
+    std::string me = a.get_str("me");
+    if (me.empty()) return ToolResult::fail("missing required parameter: me");
+    ReceiveOutcome r = message_bus().peek(me);
+    Json msgs = Json::array();
+    for (const BusMsg& m : r.messages) msgs.push_back(bus_msg_json(m));
+    Json out = Json::object();
+    out["messages"] = std::move(msgs);
+    out["count"] = static_cast<long>(r.messages.size());
+    return ToolResult::ok(std::move(out));
+}
+
+// presence: set a name online/offline (when `online` is present), OR query it (when not).
+// Advisory — lets send() report delivered_live before a receive is parked.
+ToolResult handle_msg_presence(const ToolArgs& a) {
     std::string name = a.get_str("name");
     if (name.empty()) return ToolResult::fail("missing required parameter: name");
-
-    auto configs = load_config();
-    std::vector<std::string> index_names;
-    std::string idx_arg = a.has("index") ? a.get_str("index") : s.default_index;
-    if (!idx_arg.empty()) {
-        index_names = split_csv(idx_arg);
-    } else {
-        for (auto& [n, cfg] : configs)
-            if (cfg.is_indexed()) index_names.push_back(n);
-    }
-
-    int show_lines = a.has("lines") ? (int)a.get_int("lines") : 15;
-    if (show_lines < 0) show_lines = 15;
-    std::string file_filter = a.get_str("file");
-
-    // Load call graphs.
-    std::vector<CallGraph> graphs;
-    std::vector<std::string> graph_names;
-    for (auto& idx_name : index_names) {
-        graphs.push_back(open_backend(idx_name)->load_call_graph());
-        graph_names.push_back(idx_name);
-    }
-
-    // Definition lookup: exact/signature chunk match in the index entries
-    // (same shape as cmd_explore), with a call-graph + metrics fallback.
-    struct Definition { std::string index; std::string file; uint32_t line; uint32_t end_line; uint64_t hash; };
-    std::vector<Definition> defs;
-    for (auto& idx_name : index_names) {
-        auto idx = open_backend(idx_name)->load_index();
-        for (auto& e : idx.entries) {
-            if (e.proto != EntryType::DOC) continue;
-            bool exact = (e.chunk == name);
-            bool sig = (e.chunk.size() > name.size() &&
-                        e.chunk.substr(0, name.size()) == name &&
-                        (e.chunk[name.size()] == '(' || e.chunk[name.size()] == ' '));
-            if (!exact && !sig) continue;
-            bool merged = false;
-            for (auto& u : defs) {
-                if (u.index == idx_name && u.file == e.path) {
-                    if (sig) { u.line = e.line; u.end_line = e.end_line; u.hash = e.hash; }
-                    merged = true; break;
-                }
-            }
-            if (!merged) defs.push_back({idx_name, e.path, e.line, e.end_line, e.hash});
-        }
-    }
-    if (defs.empty()) {
-        for (size_t i = 0; i < graphs.size(); i++) {
-            auto files = graphs[i].files_defining(name);
-            auto mstore = open_backend(graph_names[i])->load_metrics();
-            for (auto& f : files) {
-                uint32_t line = 0, end_line = 0; bool from_metrics = false;
-                for (auto& m : mstore.entries)
-                    if (m.name == name && m.file == f) {
-                        line = m.line; end_line = m.line + (m.lines > 0 ? m.lines - 1 : 0);
-                        from_metrics = true; break;
-                    }
-                if (!from_metrics)
-                    for (auto& e : graphs[i].edges)
-                        if (e.caller == name && e.file == f) { line = e.line; break; }
-                defs.push_back({graph_names[i], f, line, end_line, 0});
-            }
-        }
-    }
-
-    // Optional --file filter, then dedup by (index,file,line).
-    if (!file_filter.empty()) {
-        std::vector<Definition> filtered;
-        for (auto& d : defs)
-            if (d.file.find(file_filter) != std::string::npos) filtered.push_back(d);
-        defs = std::move(filtered);
-    }
-    std::vector<Definition> uniq;
-    for (auto& d : defs) {
-        bool dup = false;
-        for (auto& u : uniq)
-            if (u.index == d.index && u.file == d.file && u.line == d.line) { dup = true; break; }
-        if (!dup) uniq.push_back(d);
-    }
-
-    if (uniq.empty())
-        return ToolResult::fail(
-            "No top-level definition found for \"" + name + "\"" +
-            (a.has("index") ? " in index " + a.get_str("index") : "") +
-            ". explore matches top-level functions/types by name; methods, "
-            "locals, and concepts won't match. Try `query \"" + name + "\"` to "
-            "locate it semantically, then explore/get the result's location. "
-            "Check the name spelling and that the right index is indexed.");
-
-    if (uniq.size() > 1) {
-        // Ambiguous — return the candidates so the agent can narrow with `file`.
-        Json cands = Json::array();
-        for (auto& d : uniq) {
-            Json c = Json::object();
-            c["index"] = d.index; c["file"] = d.file; c["line"] = d.line;
-            cands.push_back(std::move(c));
-        }
-        Json out = Json::object();
-        out["name"] = name;
-        out["ambiguous"] = true;
-        out["definitions"] = std::move(cands);
-        out["hint"] = "multiple definitions — pass `file` (path substring) or `index` to disambiguate";
-        return ToolResult::ok(std::move(out));
-    }
-
-    const Definition& def = uniq[0];
-
+    if (a.has("online")) message_bus().set_online(name, a.get_bool("online"));
     Json out = Json::object();
     out["name"] = name;
-    out["index"] = def.index;
-    out["file"] = def.file;
-    out["line"] = def.line;
-    out["end_line"] = def.end_line;
-
-    // Function length from metrics.
-    int func_lines = 0;
-    {
-        auto mstore = open_backend(def.index)->load_metrics();
-        for (auto& m : mstore.entries)
-            if (m.name == name && m.file == def.file) { func_lines = m.lines; break; }
-    }
-    out["func_lines"] = func_lines;
-
-    // Staleness (best-effort).
-    bool stale = false;
-    if (def.hash != 0 && configs.count(def.index)) {
-        FileAdapter fa(def.index, configs.at(def.index));
-        auto st = fa.check_stale(def.file, def.hash);
-        if (st == EntryStatus::STALE || st == EntryStatus::MISSING) stale = true;
-    }
-    out["stale"] = stale;
-
-    // Source snippet (via op_get, same as cmd_explore's print_source).
-    if (!stale && def.line != 0 && configs.count(def.index)) {
-        int lines_to_show = show_lines;
-        if (lines_to_show == 0) {
-            if (def.end_line > def.line) lines_to_show = def.end_line - def.line + 1;
-            else if (func_lines > 0) lines_to_show = func_lines;
-            else lines_to_show = 15;
-        }
-        std::string doc_path = def.file + ":" + std::to_string(def.line);
-        auto res = op_get(EntryType::DOC, def.index, doc_path, configs.at(def.index), lines_to_show);
-        if (res.ok) out["source"] = res.message;
-    }
-
-    // Callers (dedup by name+file), same as cmd_explore's print_callers.
-    CallGraphQuery cg_query;
-    cg_query.graphs = graphs;
-    cg_query.graph_names = graph_names;
-
-    {
-        std::set<std::string> seen;
-        Json callers = Json::array();
-        for (size_t i = 0; i < graphs.size(); i++)
-            for (auto& e : graphs[i].callers_of(name)) {
-                std::string key = e.caller + "\t" + e.file;
-                if (seen.count(key)) continue; seen.insert(key);
-                std::string ix = cg_query.find_index_for(e.caller, e.file);
-                if (ix.empty()) ix = def.index;
-                Json c = Json::object();
-                c["name"] = e.caller; c["file"] = e.file; c["index"] = ix; c["line"] = e.line;
-                callers.push_back(std::move(c));
-            }
-        out["callers"] = std::move(callers);
-    }
-
-    // Callees — project-defined only (present as a caller somewhere), like
-    // cmd_explore's print_callees.
-    {
-        std::set<std::string> all_callers_set;
-        for (auto& g : graphs) for (auto& e : g.edges) all_callers_set.insert(e.caller);
-        std::set<std::string> seen;
-        Json callees = Json::array();
-        for (size_t i = 0; i < graphs.size(); i++)
-            for (auto& e : graphs[i].callees_of(name)) {
-                if (seen.count(e.callee)) continue; seen.insert(e.callee);
-                if (!all_callers_set.count(e.callee)) continue;
-                std::string ix = cg_query.find_index_for(e.callee, e.file);
-                if (ix.empty()) ix = def.index;
-                Json c = Json::object();
-                c["name"] = e.callee; c["file"] = e.file; c["index"] = ix; c["line"] = e.line;
-                callees.push_back(std::move(c));
-            }
-        out["callees"] = std::move(callees);
-    }
-
-    // Imports — project-relative only (same filter as cmd_explore).
-    {
-        auto igraph = open_backend(def.index)->load_import_graph();
-        Json imports = Json::array();
-        for (auto& imp : igraph.imports_of(def.file))
-            if (imp.size() >= 2 && imp[0] == '.' && (imp[1] == '/' || imp[1] == '.'))
-                imports.push_back(imp);
-        out["imports"] = std::move(imports);
-    }
-
-    // Doc references (markdown link graph) for .md/.mdx.
-    {
-        auto ends_with = [](const std::string& s, const std::string& suf) {
-            return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
-        };
-        if (ends_with(def.file, ".md") || ends_with(def.file, ".mdx")) {
-            auto graph = open_backend(def.index)->load_docref_graph();
-            Json refs = Json::array(), ext = Json::array(), refby = Json::array();
-            for (auto& e : graph.references_of(def.file)) {
-                Json r = Json::object(); r["target"] = e.target; r["text"] = e.text;
-                if (e.kind == RefKind::Local) refs.push_back(std::move(r));
-                else if (e.kind == RefKind::External) ext.push_back(std::move(r));
-            }
-            for (auto& src : graph.referenced_by(def.file)) refby.push_back(src);
-            out["references"] = std::move(refs);
-            out["external_references"] = std::move(ext);
-            out["referenced_by"] = std::move(refby);
-        }
-    }
-
-    // Related (semantic) — best-effort, only when the daemon is up.
-    Json related = Json::array();
-    if (daemon_is_running()) {
-        RpcClient rpc;
-        if (rpc.connected()) {
-            QueryRequest req;
-            req.query = name; req.index = idx_arg; req.type_filter = -1; req.top_k = 5;
-            std::vector<QueryResultEntry> results;
-            if (rpc.cmd_query(req, results).empty()) {
-                for (auto& r : results) {
-                    if (r.path == def.file && r.line == def.line) continue;
-                    Json j = Json::object();
-                    j["index"] = r.index; j["path"] = r.path; j["line"] = r.line;
-                    if (!r.chunk.empty()) j["chunk"] = r.chunk;
-                    related.push_back(std::move(j));
-                }
-            }
-        }
-    }
-    out["related"] = std::move(related);
-
-    // Cache a flat, get-compatible cursor list so a follow-up `get {result:N}`
-    // resolves a location without re-typing it — same contract as query/calls.
-    // Order: the definition itself (result 0), then callers, callees, related.
-    // Every cursor is {type:"doc", index, path:<file>, line, name?} so get can
-    // resolve it directly.
-    {
-        Json cursors = Json::array();
-        auto push_cursor = [&](const std::string& ix, const std::string& file,
-                               long line, const std::string& nm) {
-            if (file.empty()) return;
-            Json c = Json::object();
-            c["type"] = "doc";
-            c["index"] = ix;
-            c["path"] = file;
-            if (line > 0) c["line"] = line;
-            if (!nm.empty()) c["name"] = nm;
-            cursors.push_back(std::move(c));
-        };
-        // Definition first (result 0).
-        push_cursor(def.index, def.file, def.line, name);
-        // Then callers, callees, related — reuse the arrays already built.
-        auto push_edges = [&](const Json& edges) {
-            if (!edges.is_array()) return;
-            for (const auto& e : edges) {
-                if (!e.is_object()) continue;
-                auto gs = [&](const char* k) {
-                    auto it = e.find(k);
-                    return (it != e.end() && it->is_string()) ? it->get<std::string>() : std::string();
-                };
-                long line = 0;
-                auto lit = e.find("line");
-                if (lit != e.end() && lit->is_number_integer()) line = lit->get<long>();
-                push_cursor(gs("index"), gs("file"), line, gs("name"));
-            }
-        };
-        push_edges(out["callers"]);
-        push_edges(out["callees"]);
-        // Related uses "path"/"chunk" instead of "file"/"name".
-        if (out["related"].is_array()) {
-            for (const auto& r : out["related"]) {
-                if (!r.is_object()) continue;
-                auto gs = [&](const char* k) {
-                    auto it = r.find(k);
-                    return (it != r.end() && it->is_string()) ? it->get<std::string>() : std::string();
-                };
-                long line = 0;
-                auto lit = r.find("line");
-                if (lit != r.end() && lit->is_number_integer()) line = lit->get<long>();
-                push_cursor(gs("index"), gs("path"), line, gs("chunk"));
-            }
-        }
-        s.set_last_results(cursors);
-    }
-
+    out["online"] = message_bus().is_online(name);
     return ToolResult::ok(std::move(out));
 }
 
-// --- set_scope: set the session default index/type for subsequent tool calls
-// (P4 sessions). Read-only — mutates only per-process session state, never a
-// store. Delegates to apply_set_scope (pure, in the daemon-free registry TU) so
-// the logic is shared with the unit tests.
-ToolResult handle_set_scope(const ToolArgs& a, Session& s) {
-    Json scope = apply_set_scope(s, a);
-    return ToolResult::ok(std::move(scope));
-}
-
-// --- Write handlers (gated by [mcp] tools = read-write). Reuse RpcClient::
-// cmd_add; write to gogol's own note/glossary stores (always writable). ---
-
-ToolResult handle_add_note(const ToolArgs& a, Session& s) {
-    RpcClient rpc;
-    if (!rpc.connected())
-        return ToolResult::fail("No gogol daemon running. Start it with: gogol serve");
-    AddRequest req;
-    req.type = EntryType::NOTE;
-    req.index = a.has("index") ? a.get_str("index") : s.default_index;
-    req.path = a.get_str("path");
-    req.content = a.get_str("content");
-    req.sources = a.has("sources") ? a.get_str("sources") : "";
-    if (req.index.empty()) return ToolResult::fail("index required (or set_scope first)");
-    std::string msg = rpc.cmd_add(req);
-    // cmd_add returns the human message in BOTH cases: the "Added: ..." success
-    // text, or an "Error: ..."/connection-failure string. Treat an Error:/known
-    // failure prefix as failure; anything else is success.
-    if (msg.rfind("Error:", 0) == 0 || msg == "Not connected" ||
-        msg == "Send failed" || msg == "Read failed")
-        return ToolResult::fail(msg);
+ToolResult handle_store_read(const ToolArgs& a) {
+    std::string id = a.get_str("id");
+    if (id.empty()) return ToolResult::fail("missing required parameter: id");
+    std::string dbp = cache_db_path_mcp();
+    std::error_code ec; if (!std::filesystem::exists(dbp, ec) || ec) return ToolResult::fail("v2 memory store not found");
+    store::Store store(dbp, notes_db_path_mcp(), store::Store::ReadOnly{});
+    auto e = store.get_latest(id);
+    if (!e) return ToolResult::fail("no entry with id " + id);
     Json out = Json::object();
-    out["added"] = "note"; out["index"] = req.index; out["path"] = req.path;
-    out["message"] = msg;
+    out["id"] = e->id; out["type"] = e->type; out["source"] = e->source;
+    out["content"] = gogol::display_content(e->content);  // strip embed-enrichment scaffolding for display
+    if (!e->supersedes.empty()) out["supersedes"] = e->supersedes;
+    if (!e->superseded_by.empty()) out["superseded_by"] = e->superseded_by;
+    if (!e->resolved_from.empty()) out["resolved_from"] = e->resolved_from;
+    Json ix = Json::array(); for (auto& n : e->indexes) ix.push_back(n);
+    out["indexes"] = std::move(ix);
     return ToolResult::ok(std::move(out));
 }
 
-ToolResult handle_add_term(const ToolArgs& a, Session& s) {
-    RpcClient rpc;
-    if (!rpc.connected())
-        return ToolResult::fail("No gogol daemon running. Start it with: gogol serve");
-    AddRequest req;
-    req.type = EntryType::TERM;
-    req.index = a.has("index") ? a.get_str("index") : s.default_index;
-    req.path = a.get_str("path");       // the term
-    req.content = a.get_str("content"); // the expansion
-    if (req.index.empty()) return ToolResult::fail("index required (or set_scope first)");
-    std::string msg = rpc.cmd_add(req);
-    if (msg.rfind("Error:", 0) == 0 || msg == "Not connected" ||
-        msg == "Send failed" || msg == "Read failed")
-        return ToolResult::fail(msg);
+// Resolve a SINGLE index for the symbol tools (delve/links/grep) from the shared
+// scope resolver reading `scope` (name/path) + `ref` (root SHA). MCP has no CWD, so
+// scope-by-path can't resolve server-side — a repo NAME or a --ref SHA is the way in.
+// Replaces the retired `index` param; an unresolved scope => none() = all indexes.
+// On an INVALID path scope (nonexistent, not a repo/dir) *err is set when non-null so
+// the caller can fail — same "bad path is an error" rule as the CLI.
+static gogol::ResolvedIdx mcp_resolve_idx(const ToolArgs& a, store::Store& store,
+                                          std::string* err = nullptr) {
+    gogol::RecallScopeInputs in;
+    in.ref = a.get_str("ref");
+    in.scope = a.get_str("scope");
+    in.scope_set = !in.scope.empty();
+    // in.cwd stays empty — the MCP server has no meaningful CWD.
+    auto rsc = gogol::resolve_recall_scope(in, store.index_locations());
+    if (err) *err = rsc.error;
+    return rsc.idx;
+}
+
+ToolResult handle_store_links(const ToolArgs& a) {
+    std::string node = a.get_str("node");
+    if (node.empty()) node = a.get_str("symbol"); // back-compat alias
+    if (node.empty()) return ToolResult::fail("missing required parameter: node");
+    std::string dbp = cache_db_path_mcp();
+    std::error_code ec; if (!std::filesystem::exists(dbp, ec) || ec) return ToolResult::fail("v2 memory store not found");
+    store::Store store(dbp, notes_db_path_mcp(), store::Store::ReadOnly{});
+    std::string kind = a.get_str("kind");        // "" = any (call|import|docref)
+    std::string dir = a.get_str("direction");
+    if (dir.empty()) dir = "both";
+    int depth = a.has("depth") ? static_cast<int>(a.get_int("depth")) : 1;
+    if (depth < 1) depth = 1;
+    std::string scope_err; gogol::ResolvedIdx index = mcp_resolve_idx(a, store, &scope_err);
+    if (!scope_err.empty()) return ToolResult::fail(scope_err);
+    std::string tail = store::symbol_tail(node);
+    auto rows = store.links(tail, kind, dir, depth, index);
+    if (tail != node) {
+        auto raw = store.links(node, kind, dir, depth, index);
+        rows.insert(rows.end(), raw.begin(), raw.end());
+    }
+    Json out_links = Json::array();
+    for (auto& e : rows) {
+        Json o = Json::object();
+        o["kind"] = e.kind; o["from"] = e.src; o["to"] = e.dst;
+        o["index"] = e.idx;
+        out_links.push_back(std::move(o));
+    }
     Json out = Json::object();
-    out["added"] = "term"; out["index"] = req.index; out["term"] = req.path;
-    out["message"] = msg;
+    out["node"] = node; out["direction"] = dir;
+    if (!kind.empty()) out["kind"] = kind;
+    out["links"] = std::move(out_links);
+    out["count"] = rows.size();
+    return ToolResult::ok(std::move(out));
+}
+
+ToolResult handle_store_metrics(const ToolArgs& a) {
+    std::string dbp = cache_db_path_mcp();
+    std::error_code ec; if (!std::filesystem::exists(dbp, ec) || ec) return ToolResult::fail("v2 memory store not found");
+    store::Store store(dbp, notes_db_path_mcp(), store::Store::ReadOnly{});
+    int limit = a.has("limit") ? static_cast<int>(a.get_int("limit")) : 20;
+    if (limit <= 0) limit = 20;
+    auto rows = store.top_complexity(limit, a.get_str("filter"));
+    Json arr = Json::array();
+    for (auto& m : rows) {
+        Json o = Json::object();
+        o["file"] = m.file; o["name"] = m.name; o["line"] = m.line;
+        o["complexity"] = m.complexity; o["lines"] = m.lines;
+        o["params"] = m.params; o["returns"] = m.returns; o["max_depth"] = m.max_depth;
+        arr.push_back(std::move(o));
+    }
+    Json out = Json::object();
+    out["functions"] = std::move(arr); out["count"] = rows.size();
+    return ToolResult::ok(std::move(out));
+}
+
+// Deep-dive a symbol: definition/source + callers + callees + imports, composed
+// entirely from EXISTING store machinery (ids_for_symbol -> get for the definition;
+// links for the call/import graph). No new graph code. The "definition" is the
+// entry the symbol maps to in symbols (its own defining chunk); callers/callees
+// come from the call graph, imports from the import graph of the defining file.
+ToolResult handle_store_delve(const ToolArgs& a) {
+    std::string symbol = a.get_str("symbol");
+    if (symbol.empty()) symbol = a.get_str("name");   // accept either param name
+    if (symbol.empty()) return ToolResult::fail("missing required parameter: symbol");
+    std::string dbp = cache_db_path_mcp();
+    std::error_code ec; if (!std::filesystem::exists(dbp, ec) || ec) return ToolResult::fail("v2 memory store not found");
+    store::Store store(dbp, notes_db_path_mcp(), store::Store::ReadOnly{});
+    std::string scope_err; gogol::ResolvedIdx index = mcp_resolve_idx(a, store, &scope_err);
+    if (!scope_err.empty()) return ToolResult::fail(scope_err);
+    std::string tail = store::symbol_tail(symbol);
+
+    // Definition/source: the entry(ies) the symbol maps to (its own defining chunk).
+    Json defs = Json::array();
+    std::string def_source;
+    auto ids = store.ids_for_symbol(tail);
+    if (tail != symbol) {
+        auto raw = store.ids_for_symbol(symbol);
+        ids.insert(ids.end(), raw.begin(), raw.end());
+    }
+    for (const auto& id : ids) {
+        auto e = store.get(id);
+        if (!e) continue;
+        Json d = Json::object();
+        d["id"] = e->id; d["type"] = e->type; d["source"] = e->source;
+        if (e->line > 0) d["line"] = static_cast<long>(e->line);
+        if (e->end_line > 0) d["end_line"] = static_cast<long>(e->end_line);
+        d["content"] = e->content;
+        if (def_source.empty()) def_source = e->source;
+        defs.push_back(std::move(d));
+    }
+
+    // Callers/callees from the call graph; imports of the defining file from the
+    // import graph. All via the existing links() query — no new graph code.
+    auto to_json = [](const std::vector<store::Store::Link>& rows) {
+        Json arr = Json::array();
+        for (const auto& e : rows) {
+            Json o = Json::object();
+            o["kind"] = e.kind; o["from"] = e.src; o["to"] = e.dst; o["index"] = e.idx;
+            arr.push_back(std::move(o));
+        }
+        return arr;
+    };
+    auto callers = store.links(tail, "call", "in", 1, index);
+    auto callees = store.links(tail, "call", "out", 1, index);
+    auto imports = def_source.empty() ? std::vector<store::Store::Link>{}
+                                      : store.links(def_source, "import", "both", 1, index);
+
+    Json out = Json::object();
+    out["symbol"] = symbol;
+    out["definitions"] = std::move(defs);
+    out["callers"] = to_json(callers);
+    out["callees"] = to_json(callees);
+    out["imports"] = to_json(imports);
+    return ToolResult::ok(std::move(out));
+}
+
+ToolResult handle_store_forget(const ToolArgs& a) {
+    std::string id = a.get_str("id");
+    if (id.empty()) return ToolResult::fail("missing required parameter: id");
+    std::string dbp = cache_db_path_mcp();
+    std::error_code ec; if (!std::filesystem::exists(dbp, ec) || ec) return ToolResult::fail("v2 memory store not found");
+    store::Store store(dbp, notes_db_path_mcp());
+    int rc = store.forget_note(id);
+    if (rc == 0) return ToolResult::fail("no entry with id " + id);
+    if (rc == -1) return ToolResult::fail(
+        "id " + id + " is a disk-sourced entry (code/doc), not a note — "
+        "forget only removes LLM-authored notes; edit/delete the source file instead");
+    Json out = Json::object(); out["forgotten"] = id; out["ok"] = true;
+    return ToolResult::ok(std::move(out));
+}
+
+ToolResult handle_store_related(const ToolArgs& a) {
+    std::string id = a.get_str("id");
+    if (id.empty()) return ToolResult::fail("missing required parameter: id");
+    int limit = a.has("limit") ? static_cast<int>(a.get_int("limit")) : 10;
+    if (limit < 1) limit = 10;
+    std::string type_filter = a.get_str("type"); // "code", "doc", or empty for both
+    std::string dbp = cache_db_path_mcp();
+    std::error_code ec; if (!std::filesystem::exists(dbp, ec) || ec) return ToolResult::fail("v2 memory store not found");
+    store::Store store(dbp, notes_db_path_mcp(), store::Store::ReadOnly{});
+    auto hits = store.related(id, limit, type_filter);
+    if (hits.empty()) return ToolResult::fail("no entry with id " + id + " or no embedding");
+    Json arr = Json::array();
+    for (const auto& hit : hits) {
+        auto e = store.get(hit.id);
+        if (!e) continue;
+        Json obj = Json::object();
+        obj["id"] = e->id;
+        obj["score"] = hit.score;
+        obj["type"] = e->type;
+        obj["source"] = e->source;
+        if (!e->symbol.empty()) obj["symbol"] = e->symbol;
+        if (e->line > 0) obj["line"] = e->line;
+        arr.push_back(std::move(obj));
+    }
+    return ToolResult::ok(std::move(arr));
+}
+
+ToolResult handle_store_grep(const ToolArgs& a) {
+    std::string pattern = a.get_str("pattern");
+    if (pattern.empty()) return ToolResult::fail("missing required parameter: pattern");
+    int limit = a.has("limit") ? static_cast<int>(a.get_int("limit")) : 50;
+    if (limit < 1) limit = 50;
+    std::string dbp = cache_db_path_mcp();
+    std::error_code ec; if (!std::filesystem::exists(dbp, ec) || ec) return ToolResult::fail("v2 memory store not found");
+    store::Store store(dbp, notes_db_path_mcp(), store::Store::ReadOnly{});
+    std::string scope_err; gogol::ResolvedIdx index = mcp_resolve_idx(a, store, &scope_err);
+    if (!scope_err.empty()) return ToolResult::fail(scope_err);
+    auto hits = store.literal_search(pattern, limit, index);
+    Json arr = Json::array();
+    for (const auto& h : hits) {
+        Json obj = Json::object();
+        obj["source"] = h.source;
+        obj["line"] = h.line;
+        if (!h.symbol.empty()) obj["symbol"] = h.symbol;
+        obj["id"] = h.id;
+        arr.push_back(std::move(obj));
+    }
+    Json out = Json::object();
+    out["results"] = std::move(arr);
+    out["count"] = static_cast<long>(hits.size());
+    return ToolResult::ok(std::move(out));
+}
+
+ToolResult handle_store_add(const ToolArgs& a) {
+    std::string content = a.get_str("content");
+    if (content.empty()) return ToolResult::fail("missing required parameter: content");
+    std::string consolidate_id = a.get_str("consolidate");
+    EmbedProvider* embedder = nullptr;
+    std::vector<float> v;
+    {
+        StdoutGuard guard;  // keep llama/ggml stdout off the JSON-RPC stream
+        embedder = get_embedder_cfg();
+        if (embedder) v = embedder->embed_document(content);
+    }
+    if (!embedder) return ToolResult::fail("could not load embedder");
+    store::Store store(cache_db_path_mcp(), notes_db_path_mcp());
+    // LLM-authored note -> notes.db (content of record). Optional path scope drives
+    // path-prefix surfacing at query time; empty => a global note. The MCP server has
+    // no reliable CWD, so scope must be passed explicitly (unlike the CLI, which
+    // defaults to the CWD's git toplevel).
+    std::string scope = a.get_str("scope");
+    Json out = Json::object();
+    if (consolidate_id.empty()) {
+        std::string id = store.put_note(content, v, scope);
+        store.commit();
+        out["id"] = id;
+    } else {
+        // consolidate: forget(old) + put(new) in one Tx (see Store::consolidate_note).
+        auto r = store.consolidate_note(consolidate_id, content, v, scope);
+        store.commit();
+        out["id"] = r.id;
+        out["forgotten"] = r.forgotten;
+        out["refused"] = r.refused;
+        out["old_id"] = consolidate_id;
+    }
+    out["type"] = "note"; out["stored"] = true;
+    out["scope"] = scope;
+    out["notes"] = static_cast<long>(store.count_by_type("note"));
     return ToolResult::ok(std::move(out));
 }
 
@@ -848,40 +791,38 @@ ToolResult handle_add_term(const ToolArgs& a, Session& s) {
 // means adding its ToolDef to the registry (catalog/schema) and one entry here
 // (behavior). tools/call resolves the handler through this — no scattered
 // per-tool branching elsewhere.
-ToolResult tool_dispatch(const std::string& name, const ToolArgs& args, Session& session) {
+ToolResult tool_dispatch(const std::string& name, const ToolArgs& args) {
     static const std::unordered_map<std::string,
-        std::function<ToolResult(const ToolArgs&, Session&)>> handlers = {
-        {"query",    handle_query},
-        {"get",      handle_get},
-        {"list",     handle_list},
-        {"explore",  handle_explore},
-        {"calls",    handle_calls},
-        {"affected", handle_affected},
-        {"set_scope", handle_set_scope},
-        {"add_note", handle_add_note},
-        {"add_term", handle_add_term},
+        std::function<ToolResult(const ToolArgs&)>> handlers = {
+        // v1 index tools retired (stores migrated to v2) — their handlers have
+        // been removed from this file. Only the store_* handlers below remain.
+        {"recall",         handle_store_query},   // search memory (hybrid)
+        {"get",            handle_store_read},    // fetch one entry by id
+        {"listen",         handle_msg_listen},    // messaging over MCP: claim a name, get `me`
+        {"send",           handle_msg_send},      // combadge: send a message (opt. semantic context)
+        {"receive",        handle_msg_receive},   // combadge: block for a message (long-poll)
+        {"ack",            handle_msg_ack},       // combadge: confirm session-claimed messages
+        {"peek",           handle_msg_peek},      // combadge: list queued messages, no consume
+        {"presence",       handle_msg_presence},  // combadge: set/query a name's listening state
+        {"delve",          handle_store_delve},   // deep-dive a symbol: def + callers/callees/imports
+        {"links",          handle_store_links},   // unified graph: call|import|docref, in/out/both
+        {"metrics",        handle_store_metrics}, // complexity ranking (quality signal)
+        {"remember",       handle_store_add},     // author a note-document (consolidate= replaces one atomically)
+        {"forget",         handle_store_forget},  // remove an LLM-authored note by id
+        {"related",        handle_store_related}, // find entries related by embedding similarity
+        {"literal",        handle_store_grep},    // literal phrase search (exact match)
+        {"status",         handle_store_stats},
     };
     auto it = handlers.find(name);
     if (it == handlers.end()) return ToolResult::fail("unknown tool: " + name);
-    return it->second(args, session);
+    return it->second(args);
 }
 
-// Find a tool def by name in the registry (nullptr if absent / write-gated).
-const ToolDef* find_tool(const std::string& name, bool include_write) {
-    for (const ToolDef& def : tool_registry()) {
-        if (def.name != name) continue;
-        if (!def.read_only && !include_write) return nullptr;
-        return &def;
-    }
-    return nullptr;
-}
-
-// True if a tool with this name exists in the registry, regardless of the
-// read/write gate (used to distinguish "unknown" from "write-gated").
-bool tool_exists(const std::string& name) {
+// Find a tool def by name in the registry (nullptr if absent).
+const ToolDef* find_tool(const std::string& name) {
     for (const ToolDef& def : tool_registry())
-        if (def.name == name) return true;
-    return false;
+        if (def.name == name) return &def;
+    return nullptr;
 }
 
 // Validate that all required params are present (and non-empty for strings).
@@ -921,30 +862,42 @@ Json handle_initialize(const Json& id) {
     return make_response(id, std::move(result));
 }
 
-Json handle_tools_list(const Json& id, bool include_write) {
+Json handle_tools_list(const Json& id) {
     Json result = Json::object();
-    result["tools"] = tools_list_schema(include_write);
+    result["tools"] = tools_list_schema(messaging_enabled());
     return make_response(id, std::move(result));
 }
 
-Json handle_tools_call(const Json& id, const Json& params, bool include_write,
-                       Session& session) {
+// Messaging over MCP: when the caller passes `me` (the handle from listen), every tool
+// result also says how many messages wait for it, as a second text block the model sees.
+// Shown once per change (MessageBus::unread_hint). Not for the bus tools themselves,
+// which already report the inbox.
+void append_unread_hint(const std::string& tool, const ToolArgs& args, Json& result) {
+    if (!messaging_enabled()) return;
+    if (tool == "listen" || tool == "receive" || tool == "peek" || tool == "ack" ||
+        tool == "presence")
+        return;
+    const std::string me = args.get_str("me");
+    if (me.empty()) return;
+    auto hint = message_bus().unread_hint(me);
+    if (!hint) return;
+    std::string from;
+    for (const auto& f : hint->from) from += (from.empty() ? "" : ", ") + f;
+    Json block = Json::object();
+    block["type"] = "text";
+    block["text"] = "\xF0\x9F\x93\x9F " + std::to_string(hint->count) + " unread message" +
+                    (hint->count == 1 ? "" : "s") + " for " + me + " (from: " + from + ").";
+    result["content"].push_back(std::move(block));
+}
+
+Json handle_tools_call(const Json& id, const Json& params) {
     if (!params.is_object() || !params.contains("name") || !params["name"].is_string())
         return make_error(id, kInvalidParams, "tools/call requires a string 'name'");
 
     std::string name = params["name"].get<std::string>();
-    const ToolDef* def = find_tool(name, include_write);
-    if (!def) {
-        // Distinguish a genuinely unknown tool from one that exists but is
-        // write-gated under `tools = read` (defensive: refuse even if the
-        // client knows the name).
-        if (tool_exists(name))
-            return make_error(id, kInvalidParams,
-                              "tool '" + name +
-                                  "' requires write access; set [mcp] tools = "
-                                  "read-write in ~/.gogol/config to enable it");
+    const ToolDef* def = find_tool(name);
+    if (!def)
         return make_error(id, kMethodNotFound, "unknown tool: " + name);
-    }
 
     ToolArgs args;
     if (params.contains("arguments") && params["arguments"].is_object())
@@ -960,15 +913,40 @@ Json handle_tools_call(const Json& id, const Json& params, bool include_write,
     // The registry validated existence + params + the read/write gate above;
     // execution is bound in one table (tool_dispatch) — adding a tool is its
     // ToolDef (catalog/schema) + one dispatch entry.
-    ToolResult tr = tool_dispatch(name, args, session);
-    return make_response(id, wrap_tool_result(tr));
+    ToolResult tr = tool_dispatch(name, args);
+    Json result = wrap_tool_result(tr);
+    append_unread_hint(name, args, result);
+    return make_response(id, std::move(result));
+}
+
+}  // namespace
+
+void set_bus_db_path(const std::string& path) { g_bus_db_path = path; }
+void set_messaging_override(int on) { g_messaging_override = on; }
+int requeue_bus_claims() { return message_bus().requeue_all_claims(); }
+
+void start_bus_sweeper() {
+    std::thread([]() {
+        for (;;) {
+            long now = static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+            try {
+                auto r = message_bus().sweep(now);
+                if (r.requeued || r.pruned)
+                    fprintf(stderr, "gogol daemon: bus sweep requeued %d, pruned %d\n",
+                            r.requeued, r.pruned);
+            } catch (const std::exception& e) {
+                fprintf(stderr, "gogol daemon: bus sweep failed: %s\n", e.what());
+            }
+            std::this_thread::sleep_for(std::chrono::hours(1));
+        }
+    }).detach();
 }
 
 // Process a single already-parsed JSON-RPC request object. `has_id` reports
 // whether the message carries an id (notifications have none → no response).
 // Returns true if a response should be written (via `out_response`).
-bool process_request(const Json& msg, bool include_write, Session& session,
-                     Json& out_response) {
+bool process_request(const Json& msg, Json& out_response) {
     // id is echoed back; null for notifications / when absent.
     Json id = (msg.is_object() && msg.contains("id")) ? msg["id"] : Json(nullptr);
 
@@ -992,11 +970,11 @@ bool process_request(const Json& msg, bool include_write, Session& session,
         return false;
     }
     if (method == "tools/list") {
-        out_response = handle_tools_list(id, include_write);
+        out_response = handle_tools_list(id);
         return true;
     }
     if (method == "tools/call") {
-        out_response = handle_tools_call(id, params, include_write, session);
+        out_response = handle_tools_call(id, params);
         return true;
     }
 
@@ -1005,39 +983,109 @@ bool process_request(const Json& msg, bool include_write, Session& session,
     return true;
 }
 
-}  // namespace
+// --- idle-timeout (daemon self-exit when no activity) ---
+// A process-global monotonic "last request" stamp bumped by handle_request_json (the one
+// choke-point every transport routes through). The daemon arms an idle watcher that
+// _Exit()s the process once (now - last_activity) exceeds the timeout. No refcount: an
+// idle timer can't be wedged by a crashed client (unlike a connection count). The shim
+// transparently respawns the daemon on the next request, so idle-exit is invisible.
+static std::atomic<long> g_last_activity{0};
+static long mono_secs() {
+    return static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+void touch_activity() { g_last_activity.store(mono_secs(), std::memory_order_relaxed); }
 
-int run_stdio_server(std::istream& in, std::ostream& out, bool include_write) {
-    Session session;  // per-process session state (scope grows in P4)
+void start_idle_watcher(int timeout_secs) {
+    if (timeout_secs <= 0) return;  // 0 = never idle-exit
+    touch_activity();               // start the clock now
+    std::thread([timeout_secs]() {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            long idle = mono_secs() - g_last_activity.load(std::memory_order_relaxed);
+            if (idle >= timeout_secs) {
+                fprintf(stderr, "gogol daemon: idle %lds >= %ds, exiting.\n", idle, timeout_secs);
+                std::_Exit(0);  // skip fragile Metal static teardown (INVARIANT §6)
+            }
+        }
+    }).detach();
+}
+
+// Build identity for the daemon<->shim version handshake (external linkage — the shim
+// calls THIS same function, so both sides get the identical string from one TU; defining
+// it per-TU would risk __DATE__/__TIME__ skew between the daemon and shim builds).
+// Compile timestamp => changes on every rebuild, so a rebuilt shim detects a stale daemon.
+std::string daemon_build_id() {
+    return std::string(kServerVersion) + "+" + __DATE__ " " __TIME__;
+}
+
+// Transport-shared: parse + dispatch + error-wrap one raw request string. The ONE place
+// the parse/process/try-catch logic lives; stdio, HTTP, and the unix socket all call it.
+std::optional<std::string> handle_request_json(const std::string& raw) {
+    touch_activity();  // any request resets the idle clock
+    Json msg;
+    std::string parse_err;
+    if (!json_parse(raw, msg, &parse_err)) {
+        Json resp = make_error(Json(nullptr), kParseError, "parse error: " + parse_err);
+        return resp.dump();
+    }
+    // Daemon<->shim version handshake: the shim sends {method:"__daemon_version",
+    // params:{client_build:"..."}} as its FIRST request. If the client's build differs
+    // from ours, WE are the stale daemon (the shim was rebuilt) — report mismatch and
+    // self-exit shortly after responding so the shim respawns a fresh daemon. A matching
+    // build just confirms. This is NOT a normal tool; handled before dispatch.
+    if (msg.is_object() && msg.value("method", std::string()) == "__daemon_version") {
+        std::string mine = daemon_build_id();
+        std::string theirs = (msg.contains("params") && msg["params"].is_object())
+            ? msg["params"].value("client_build", std::string()) : std::string();
+        bool match = theirs.empty() || theirs == mine;
+        Json resp = Json::object();
+        resp["jsonrpc"] = "2.0";
+        resp["id"] = (msg.contains("id") ? msg["id"] : Json(nullptr));
+        Json r = Json::object();
+        r["build"] = mine;
+        r["match"] = match;
+        resp["result"] = std::move(r);
+        if (!match) {
+            // Stale daemon: exit shortly so the response flushes first, then the shim
+            // respawns the current binary. Detached timer thread.
+            std::thread([]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                fprintf(stderr, "gogol daemon: build mismatch with client, exiting for respawn.\n");
+                std::_Exit(0);
+            }).detach();
+        }
+        return resp.dump();
+    }
+    Json response;
+    bool have_response = false;
+    try {
+        have_response = process_request(msg, response);
+    } catch (const std::exception& e) {
+        Json id = (msg.is_object() && msg.contains("id")) ? msg["id"] : Json(nullptr);
+        response = make_error(id, kInternalError, std::string("internal error: ") + e.what());
+        have_response = true;
+    }
+    if (!have_response) return std::nullopt;  // notification: no response
+    return response.dump();
+}
+
+int run_stdio_server(std::istream& in, std::ostream& out) {
     std::string line;
     while (std::getline(in, line)) {
         // Skip blank lines between messages.
         if (line.empty()) continue;
-
-        Json msg;
-        std::string parse_err;
-        if (!json_parse(line, msg, &parse_err)) {
-            Json resp = make_error(Json(nullptr), kParseError, "parse error: " + parse_err);
-            out << resp.dump() << "\n";
-            out.flush();
-            continue;
-        }
-
-        Json response;
-        bool have_response = false;
-        try {
-            have_response = process_request(msg, include_write, session, response);
-        } catch (const std::exception& e) {
-            Json id = (msg.is_object() && msg.contains("id")) ? msg["id"] : Json(nullptr);
-            response = make_error(id, kInternalError, std::string("internal error: ") + e.what());
-            have_response = true;
-        }
-
-        if (have_response) {
-            out << response.dump() << "\n";
+        // Parse + dispatch + error-wrap via the shared handler (one logic site).
+        if (auto resp = handle_request_json(line)) {
+            out << *resp << "\n";
             out.flush();
         }
     }
+    // stdin EOF: the client is done. Join any outstanding spillover refresh
+    // threads so none holds a llama/ggml Metal context during process teardown
+    // (that trips the Metal backend's static-destructor assert). Progress is
+    // durable per-file, so even if a join takes a moment it only finishes work.
+    join_spillover_threads();
     return 0;
 }
 
@@ -1045,15 +1093,102 @@ int run_stdio_server(std::istream& in, std::ostream& out, bool include_write) {
 }  // namespace gogol
 
 int cmd_mcp() {
-    // Config gating (P3): the MCP server is off unless explicitly enabled in
-    // ~/.gogol/config. Refuse to start with a clear message BEFORE entering the
-    // stdio loop. `tools = read-write` gates write tools; default is read-only.
+    // The MCP server is off unless explicitly enabled in ~/.gogol/config.
+    // Refuse to start with a clear message BEFORE entering the stdio loop.
+    // `gogol mcp` is a local stdio tool — all tools are exposed once enabled
+    // (no read/write gate).
     GlobalConfig gc = load_global_config();
     if (!gc.mcp_enabled) {
         std::cerr << "MCP server is disabled. Enable it with [mcp] enabled = true "
                      "in ~/.gogol/config\n";
         return 1;
     }
-    const bool include_write = gc.mcp_read_write();
-    return gogol::mcp::run_stdio_server(std::cin, std::cout, include_write);
+
+    // Daemon mode: if [mcp] socket is enabled, `gogol mcp` is a thin SHIM — it connects
+    // to (or spawns) the warm daemon over the unix socket instead of loading a model
+    // in-process. This is what makes per-chat stdio cheap AND keeps one SQLite writer.
+    // If the shim can't reach/start the daemon, fall back to in-process stdio (below) so
+    // the agent is never left without gogol.
+    if (gc.socket_enabled) {
+        std::string socket_path = gc.socket_path.empty()
+            ? (gogol_home() + "/daemon.sock") : gc.socket_path;
+        int rc = gogol::mcp::run_stdio_shim(socket_path);
+        if (rc == 0) { std::cout.flush(); std::_Exit(0); }
+        std::cerr << "gogol: daemon shim failed — falling back to in-process stdio.\n";
+        // fall through to in-process below.
+    }
+
+    int rc = gogol::mcp::run_stdio_server(std::cin, std::cout);
+    // INVARIANT §6 (docs/INVARIANTS.md): short-lived Metal tools must _Exit.
+    // Bypass C++ static-destructor teardown: the vendored llama/ggml Metal backend
+    // asserts in its static dtor (ggml_metal_device_free) during __cxa_finalize,
+    // aborting an otherwise-clean exit. All output is already flushed (the loop
+    // flushes per-response + at EOF) and spillover threads are joined, so there is
+    // nothing left to clean up in-process — the OS reclaims everything. _Exit skips
+    // the fragile static teardown. (If gogol later gains non-Metal state that needs
+    // a graceful dtor, revisit — today the only such state is the embedder, whose
+    // teardown is exactly the thing that aborts.)
+    std::cout.flush();
+    std::_Exit(rc);
+}
+
+int cmd_serve(const std::string& host, int port) {
+    // THE DAEMON: a flock-guarded singleton holding the warm embedder + SQLite (sole
+    // writer), serving whichever transports the config enables — a local UNIX SOCKET
+    // (thin stdio shims connect; no TCP, no LAN exposure) AND/OR HTTP (remote + dashboard).
+    // Both are blocking accept loops, so each runs on its own thread; the main thread waits.
+    GlobalConfig gc = load_global_config();
+
+    // Singleton: only one daemon per gogol home may own the store (SQLite single-writer).
+    // flock auto-releases on process death — no stale lock, no spawn race. If we lose it,
+    // another daemon is already serving; exit quietly (the shim will connect to it).
+    std::string lock_path = gogol_home() + "/daemon.lock";
+    gogol::mcp::DaemonLock lock(lock_path);
+    if (!lock.has_lock()) {
+        fprintf(stderr, "gogol serve: another daemon already holds %s — not starting a second.\n",
+                lock_path.c_str());
+        return 0;  // not an error: the existing daemon is the singleton.
+    }
+
+    // Resolve the socket path (config override, else gogol_home/daemon.sock).
+    std::string socket_path = gc.socket_path.empty()
+        ? (gogol_home() + "/daemon.sock") : gc.socket_path;
+
+    // Which transports? CLI --host/--port drive HTTP (back-compat: `gogol serve` with no
+    // [mcp] socket still serves HTTP as before). socket_enabled adds the unix socket.
+    bool want_http = port > 0;
+    bool want_socket = gc.socket_enabled;
+    if (!want_http && !want_socket) {
+        // No transport configured at all: preserve the old default (HTTP on the given port).
+        want_http = true;
+    }
+    if (want_http && host != "127.0.0.1" && host != "localhost")
+        fprintf(stderr, "WARNING: binding %s exposes recall/notes with NO auth.\n", host.c_str());
+
+    // Persistent message bus: open messages.db now (under the singleton lock, so this
+    // process is its only writer) and requeue claims left by sessions of the previous
+    // daemon, which cannot ack anymore.
+    gogol::mcp::set_bus_db_path(messages_db_path());
+    int requeued = gogol::mcp::requeue_bus_claims();
+    if (requeued > 0) fprintf(stderr, "gogol daemon: requeued %d unacked message(s)\n", requeued);
+    gogol::mcp::start_bus_sweeper();  // now, then hourly
+
+    // Arm idle-timeout (config idle_timeout_secs; 0 = never). The daemon self-exits when
+    // no request has arrived for that long; the shim respawns it on the next request.
+    gogol::mcp::start_idle_watcher(gc.idle_timeout_secs);
+
+    std::vector<std::thread> transports;
+    if (want_socket) {
+        fprintf(stderr, "gogol daemon: unix socket %s\n", socket_path.c_str());
+        transports.emplace_back([socket_path]() { gogol::mcp::run_unix_socket_server(socket_path); });
+    }
+    if (want_http) {
+        transports.emplace_back([host, port]() { gogol::mcp::run_http_server(host, port); });
+    }
+    // Wait on the transports forever (they're infinite accept loops). Join blocks the
+    // main thread; the process exits via _Exit from a transport error or a signal.
+    for (auto& t : transports) t.join();
+
+    std::cout.flush();
+    std::_Exit(0);
 }

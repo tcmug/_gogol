@@ -31,14 +31,4 @@ inline bool json_parse(const std::string& text, Json& out, std::string* error = 
     return true;
 }
 
-// Fetch a string field by key, returning `fallback` if the key is missing or
-// not a string. Never throws.
-inline std::string json_get_string(const Json& obj, const std::string& key,
-                                    const std::string& fallback = "") {
-    if (!obj.is_object()) return fallback;
-    auto it = obj.find(key);
-    if (it == obj.end() || !it->is_string()) return fallback;
-    return it->get<std::string>();
-}
-
 }  // namespace gogol

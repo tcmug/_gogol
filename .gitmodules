@@ -7,9 +7,6 @@
 [submodule "vendor/tree-sitter-typescript"]
 	path = vendor/tree-sitter-typescript
 	url = https://github.com/tree-sitter/tree-sitter-typescript.git
-[submodule "vendor/tree-sitter-graphql"]
-	path = vendor/tree-sitter-graphql
-	url = https://github.com/bkegley/tree-sitter-graphql.git
 [submodule "vendor/tree-sitter-python"]
 	path = vendor/tree-sitter-python
 	url = https://github.com/tree-sitter/tree-sitter-python.git
@@ -31,3 +28,6 @@
 [submodule "vendor/sqlite-vec"]
 	path = vendor/sqlite-vec
 	url = https://github.com/asg017/sqlite-vec.git
+[submodule "vendor/tree-sitter-gdscript"]
+	path = vendor/tree-sitter-gdscript
+	url = https://github.com/PrestonKnopp/tree-sitter-gdscript.git

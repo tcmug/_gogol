@@ -6,9 +6,9 @@
 //   - tools/call param validation   (P2)
 //   - tools/call dispatch           (P2, registry lookup by name)
 //
-// This is the change-resilience contract from docs/design/mcp-server.md:
-// adding/changing a tool touches ONLY its ToolDef here. No hand-written schema,
-// no dispatch switch, no wire changes (handlers reuse the existing RpcClient).
+// The change-resilience contract: adding/changing a tool touches ONLY its
+// ToolDef here. No hand-written schema, no dispatch switch, no wire changes
+// (handlers reuse the existing RpcClient).
 #pragma once
 
 #include <string>
@@ -78,96 +78,36 @@ struct ToolResult {
     }
 };
 
-// A single resolved result cursor: the (type, index, path, line) triple of one
-// entry from the last query/calls result set. Lets a follow-up `get` reference
-// a result by 0-based index instead of re-specifying the full location.
-struct ResultRef {
-    std::string type;   // "doc" | "note" | "term" (empty when unknown)
-    std::string index;  // owning index
-    std::string path;   // entry path (no :line suffix)
-    long line = 0;      // line within the file (0 = none)
-    bool valid = false; // false when the requested cursor is out of range
-};
-
-// Per-connection MCP session state (P4). Sessions are per-process — one
-// `gogol mcp` == one client connection — ephemeral, and NOT persisted. The
-// daemon stays session-agnostic; scope + cursors are a front-end concern.
-//
-// Carries:
-//   - default scope (index/type) inherited when a tool omits it, and
-//   - a result-cursor cache (`last_results`) holding the last query/calls hit
-//     list so a follow-up `get result N` resolves against it without re-query.
-struct Session {
-    std::string default_index;  // inherited scope when a tool omits `index`
-    std::string default_type;   // inherited type filter
-
-    // Cache of the last query/calls result array (JSON array of hit objects,
-    // each with at least {index, path} and optionally {type, line}). Small and
-    // ephemeral; overwritten by the next query/calls.
-    Json last_results = Json::array();
-
-    // Store a fresh result set (an array). Non-arrays reset the cache to empty.
-    void set_last_results(Json results) {
-        last_results = results.is_array() ? std::move(results) : Json::array();
-    }
-
-    // Resolve a 0-based result number to its (type, index, path, line) triple
-    // from the cached last_results. Returns a ResultRef with valid=false when
-    // the cache is empty or `n` is out of range. Pure; no daemon.
-    ResultRef result_ref(long n) const {
-        ResultRef ref;
-        if (!last_results.is_array() || n < 0 ||
-            static_cast<size_t>(n) >= last_results.size())
-            return ref;  // valid=false
-        const Json& hit = last_results[static_cast<size_t>(n)];
-        if (!hit.is_object()) return ref;
-        auto get_s = [&](const char* k) -> std::string {
-            auto it = hit.find(k);
-            return (it != hit.end() && it->is_string()) ? it->get<std::string>() : std::string();
-        };
-        ref.index = get_s("index");
-        ref.path = get_s("path");
-        ref.type = get_s("type");
-        auto lit = hit.find("line");
-        if (lit != hit.end() && lit->is_number_integer()) ref.line = lit->get<long>();
-        // A usable cursor needs at least an index + path.
-        ref.valid = !ref.index.empty() && !ref.path.empty();
-        return ref;
-    }
-};
-
-// Apply a set_scope tool call to a session: update default_index / default_type
-// from the args, leaving any omitted field unchanged. Pure (no daemon), so both
-// the MCP dispatch and unit tests share one implementation. Returns the current
-// scope as {index, type} for confirmation.
-inline Json apply_set_scope(Session& s, const ToolArgs& a) {
-    if (a.has("index")) s.default_index = a.get_str("index");
-    if (a.has("type")) s.default_type = a.get_str("type");
-    Json out = Json::object();
-    out["index"] = s.default_index;
-    out["type"] = s.default_type;
-    return out;
-}
-
 // One tool declaration — the single source of truth for a gogol MCP tool.
 struct ToolDef {
     std::string name;
     std::string description;
     std::vector<ToolParam> params;
-    bool read_only = true;  // write tools are gated separately (tools = read-write)
+    // Hidden from tools/list (not advertised to the model) but still callable + validated
+    // by name. For transport primitives a client invokes directly but a general agent must
+    // NOT see — e.g. the combadge message-bus tools (receive/peek/send/presence): the
+    // combadge EXTENSION calls them by name over the wire, but advertising them to every
+    // gogol-connected agent makes models abuse `receive` (a 5-min blocking long-poll) and
+    // race the extension's own wait loop. Hidden keeps them working for combadge while
+    // invisible to code-search agents.
+    bool hidden = false;
+    // Advertised in tools/list only when `[mcp] messaging = true` (agent messaging over
+    // MCP). Ignored for hidden tools, which are never advertised.
+    bool messaging = false;
 };
 
 // The ONE catalog. Built once, returned by const reference.
 const std::vector<ToolDef>& tool_registry();
 
-// Generate the MCP tools/list array from the registry. Read-only tools are
-// always included; write tools (read_only=false) are included only when
-// include_write is true. Each entry is a JSON object:
+// Generate the MCP tools/list array from the registry. Every tool is included:
+// `gogol mcp` is a local stdio tool, so there is no read/write gate. Each entry
+// is a JSON object:
 //   { "name", "description",
 //     "inputSchema": { "type":"object",
 //                      "properties": { <param>: {"type","description"} },
 //                      "required": [ ...names of required params... ] } }
-Json tools_list_schema(bool include_write);
+// tools/list schema. messaging=true also advertises the messaging tools (listen, send).
+Json tools_list_schema(bool messaging = false);
 
 }  // namespace mcp
 }  // namespace gogol

@@ -1,60 +1,32 @@
 // commands.h — CLI command handlers
 #pragma once
-#include "core/loc.h"
 #include <string>
 #include <vector>
 
-class RpcClient;
-
-// Returns true if the daemon is running and rpc is connected. Otherwise prints
-// "No gogol daemon running. Start it with: gogol serve" to stderr and returns
-// false. All read/write commands require the daemon (direct mode was removed).
-bool require_daemon(RpcClient& rpc);
-
+// Args carries the parsed CLI options for the live subcommands.
 struct Args {
-    std::string name;
-    std::string model;
-    std::string scope;
-    std::string query_text;
-    std::string topic;
-    std::string content;
-    std::string content_file;
-    std::string uri;
-    std::string sources;
-    // Explicit entry-type command model (no sigils):
-    //   add/get/rm <type> <index> <path>, list [<type>] <index>, query --type
-    EntryType entry_type = EntryType::DOC; // parsed from type_arg
-    std::string type_arg;                  // "doc"/"note"/"term" token
-    std::string path_arg;                  // path/topic/term argument
-    bool has_type = false;                 // list: whether a type token was given
-    int top_k = 5;
-    int show_lines = 0;
-    int get_lines = 0;   // get -n (dedicated so explore's -n default_val(15) can't bleed in)
-    int depth = 1;
-    int limit = 20;
-    std::string sort_by;
-    bool force = false;
-    bool debug = false;
-    bool scores = false;
-    bool verbose = false;
-    bool calls_in = false;
-    bool calls_out = false;
-    bool use_stdin = false;
-    std::string path_mode;
-    std::string filter;
-    std::vector<std::string> files;
+    std::string model;       // embedding model path
+    std::string query_text;  // recall <text> / links <node> / delve <symbol> / literal <pattern>
+    std::string content;     // remember <content> / index <dir>
+    std::string uri;         // get <id> / forget <id>
+    int top_k = 5;           // recall --top / literal --limit
+    std::string link_kind;   // links --kind (call|import|docref)
+    std::string link_dir;    // links --direction (out|in|both)
+    int link_depth = 1;      // links --depth (transitive hops)
+    std::string type_filter; // recall --type (note|doc|code)
+    std::string scope;       // remember --scope / recall query scope (default CWD git toplevel)
+    std::string consolidate_id; // remember --consolidate <id>: forget this note, atomically, with the put
+    bool scope_set = false;  // whether --scope was explicitly given (distinguish "" global from unset)
+    std::string metrics_filter; // metrics [file] path/file substring filter
+    int metrics_limit = 20;  // metrics --limit
+    bool overlay_stop = false;   // overlay --stop: clear the overlay flag instead of setting it
+    std::string ref;         // recall --ref <root-sha>: portable repo identity (read-only lookup)
 };
 
-int cmd_index(const Args& args);
-int cmd_query(const Args& args);
-int cmd_add(const Args& args);
-int cmd_rm(const Args& args);
-int cmd_get(const Args& args);
-int cmd_status(const Args& args);
-int cmd_sync(const Args& args);
-int cmd_list(const Args& args);
-int cmd_prune(const Args& args);
-int cmd_calls(const Args& args);
-int cmd_metrics(const Args& args);
-int cmd_affected(const Args& args);
-int cmd_explore(const Args& args);
+// Top-level verbs (CLI/MCP-parallel): fetch by id (GET), semantic search (QUERY),
+// literal phrase search (LITERAL), deep-dive a symbol (DELVE), graph navigation (LINKS),
+// complexity ranking (METRICS), author a note (ADD_NOTE), remove a note (FORGET), find
+// related entries (RELATED), index a repo (INDEX_PATH), store stats pointer (STATS).
+// (Replacing a note is ADD_NOTE with consolidate_id set — no separate action.)
+enum class StoreAction { STATS, QUERY, LITERAL, ADD_NOTE, INDEX_PATH, FORGET, LINKS, GET, DELVE, METRICS, RELATED, OVERLAY };
+int cmd_store(const Args& args, StoreAction action);

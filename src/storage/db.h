@@ -10,7 +10,8 @@
 // foreign_keys=ON), and ensures the gogol schema exists. Every sqlite3 return
 // code is checked; failures throw std::runtime_error carrying sqlite3_errmsg.
 //
-// This is Phase 2 groundwork (see docs/design/storage-architecture.md). It does
+// This is a low-level SQLite connection primitive (see docs/DESIGN.md §2 for the
+// store's data model). It does
 // NOT implement SqliteBackend — it only provides the connection primitive that
 // backend will be built on.
 class Db {
@@ -19,8 +20,10 @@ public:
     // big-endian bytes 0x47 0x4F 0x47 0x4F). Marks a file as a gogol database.
     static constexpr int32_t kApplicationId = 0x474F474F;
 
-    // Opens (creating if needed), applies PRAGMAs, and ensures the schema.
-    explicit Db(const std::string &path);
+    // Opens (creating if needed unless read_only), applies PRAGMAs. read_only opens
+    // with SQLITE_OPEN_READONLY — the connection physically cannot take a write lock,
+    // so reads never contend with a concurrent writer (WAL serves them from the snapshot).
+    explicit Db(const std::string &path, bool read_only = false);
     ~Db();
 
     Db(const Db &) = delete;
@@ -35,13 +38,18 @@ public:
 
     sqlite3 *raw() { return db_; }
 
+    // Create the v1 gogol schema (entries/notes/edges/...). No longer called by
+    // the ctor; SqliteBackend calls it explicitly. v2 stores do NOT call this —
+    // they apply their own schema, so the primitive stays schema-agnostic.
+    void ensure_schema();
+
     // RAII prepared statement. Wraps a sqlite3_stmt*, finalizes on destruction.
     // Bind params with 1-based indices; read columns with 0-based indices.
     // step() returns true while a row is available (SQLITE_ROW), false at
     // SQLITE_DONE. Any sqlite3 error throws std::runtime_error.
     class Stmt {
     public:
-        Stmt(Db &db, const std::string &sql);
+        explicit Stmt(Db &db, const std::string &sql);
         ~Stmt();
 
         Stmt(const Stmt &) = delete;
@@ -49,6 +57,7 @@ public:
 
         // Bind params (1-based index, per sqlite3 convention).
         void bind(int index, int64_t value);
+        void bind(int index, double value);
         void bind(int index, const std::string &value);
         void bind(int index, const void *data, int size); // BLOB
         void bind_null(int index);
@@ -58,7 +67,10 @@ public:
 
         // Read columns from the current row (0-based index).
         int64_t column_int64(int col);
+        double column_double(int col);
         std::string column_text(int col);
+        const void* column_blob(int col);
+        int column_bytes(int col);
 
         // Reset so the statement can be re-executed (clears bindings too).
         void reset();
@@ -90,8 +102,8 @@ public:
 
 private:
     void apply_pragmas();
-    void ensure_schema();
     void repair_fts_schema(); // recreate entries_fts if it has a stale column set
 
     sqlite3 *db_ = nullptr;
+    bool read_only_ = false;
 };

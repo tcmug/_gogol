@@ -1,13 +1,6 @@
-// Live helpers only: cosine similarity, f16 conversion, and path->index lookup.
-// Index metadata + embeddings are persisted/loaded through SqliteBackend, which
-// materializes every entry's embedding eagerly in load_index() (emb_loaded=true).
+// index_file.cpp — f16 (half-precision float) conversion helpers.
 #include "storage/index_file.h"
-#include "config/config.h"
-
-#include <cmath>
 #include <cstring>
-
-namespace fs = std::filesystem;
 
 // --- float16 conversion (IEEE 754 half-precision) ---
 
@@ -38,43 +31,4 @@ float f16_to_float(uint16_t h) {
   float f;
   std::memcpy(&f, &result, 4);
   return f;
-}
-
-// --- Public API ---
-
-// Embeddings are materialized eagerly by SqliteBackend::load_index (which sets
-// emb_loaded), so this is a no-op guard: the only surviving purpose is to mark
-// an empty index as "loaded". The legacy .emb sidecar reader was removed with
-// the SQLite-only migration.
-void Index::ensure_embeddings() {
-  emb_loaded = true;
-}
-
-// --- Utility ---
-
-std::string find_index_for_path(const fs::path &dir) {
-  std::string abs = fs::canonical(dir).string();
-  auto configs = load_config();
-  for (auto &[name, cfg] : configs) {
-    for (auto &p : cfg.paths) {
-      std::error_code ec;
-      std::string canon = fs::canonical(p, ec).string();
-      if (!ec && (abs == canon || abs.rfind(canon + "/", 0) == 0))
-        return name;
-    }
-  }
-  return {};
-}
-
-float cosine_similarity(const std::vector<float> &a,
-                        const std::vector<float> &b) {
-  if (a.size() != b.size() || a.empty()) return 0.0f;
-  float dot = 0, na = 0, nb = 0;
-  for (size_t i = 0; i < a.size(); i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
-  }
-  float denom = std::sqrt(na) * std::sqrt(nb);
-  return denom > 0 ? dot / denom : 0.0f;
 }

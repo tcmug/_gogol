@@ -1,203 +1,201 @@
 ---
 name: gogol
 description: >
-  Code search, call-graph navigation, and knowledge store. Use for finding code,
-  tracing function relationships, storing findings, and navigating unfamiliar codebases.
+  Semantic code search and knowledge store backed by local embeddings, exposed as
+  MCP tools namespaced `mcp__gogol__*`: recall, get, delve, links, metrics,
+  related, literal, remember, forget, status. Use when: finding code by meaning
+  (not grep), tracing function call/import relationships, ranking refactor
+  candidates by cyclomatic complexity, storing durable findings/decisions as
+  notes, and resuming a prior session in the same repo via a scoped session note.
+  Explicit triggers: search code, explore call graphs, store a finding, resume
+  session. Do NOT load for generic coding queries that need neither semantic
+  search nor the cross-session note store.
 user_invocable: true
 ---
 
 # gogol
 
-Semantic search and knowledge store backed by local embeddings. Daemon should be running (`gogol serve`).
+Kind: reference
 
-## Decision Flow
+Semantic search + knowledge store, local embeddings, exposed as MCP tools
+`mcp__gogol__<tool>`. Params are JSON keys, not CLI flags (`scope="web"`,
+never `--scope web`). Zero-config, daemon-less — auto-indexes a git repo on
+first scoped `recall` (`indexing: true` = background refresh still running).
+Optional params omitted → sensible defaults.
 
-Start here. Pick the right tool for the intent:
+## Tools & decision flow
 
-| Intent | Command | Why |
-|--------|---------|-----|
-| Understand a specific function | `gogol explore` | One call: signature, source, callers, callees, imports, related |
-| Find code by concept/meaning | `gogol query` | Semantic + keyword hybrid search |
-| Trace call chains structurally | `gogol calls` | AST-extracted, no source reading needed |
-| Find blast radius of a change | `gogol affected` | Transitive import graph traversal |
-| Read source at a known location | `gogol get` | Direct retrieval by location |
-| Find exact strings/identifiers | `grep` | Literal match, not semantic |
+Pick by what you already know. **Searching code → a gogol tool, not `bash`
+grep/rg/find/sed** — gogol has semantic, FTS5, and AST call-graph indexes
+grep can't reach; grep returns flat text with no structure, related entries,
+call graph, or notes. (The tell you're grepping instead of picking a gogol
+tool: an alternation regex, or scanning a file list to `read` each one.)
 
-**Key rule:** If query found the right location, `get` or `explore` it. Don't query again with different terms hoping for better output — retrieve what you found.
+| You know... | Tool | Not (bash) |
+|---|---|---|
+| Exact string/symbol (`move_frame_origin`, `DATABASE_URL`, `TODO:`) | `literal` | `grep -rn`, `rg` |
+| Function/symbol name + want def, callers, callees, imports | `delve` | `grep` then `read` each |
+| Concept/meaning ("payment capture flow"), or an alternation (`foo\|bar`) | `recall` | `grep -E` |
+| Callers / callees / transitive import deps of a known symbol or file | `links` | `grep` for the name |
+| Code/docs similar to a `recall`/`delve` result you have (its `id`) | `related` | a new `recall` with different words |
+| Refactor candidates by cyclomatic complexity | `metrics` | eyeballing files |
+| Read a found entry's full content (have its `id`) | `get` | — |
 
-**grep anti-pattern:** If your grep pattern is an alternation of guessed names (`fooHandler|handleFoo|onFoo`, `user.?[Ss]ession|UserSession`), stop. The alternation means you don't know the exact string — that's a semantic search. Use `gogol query "<the intent>"` instead. Widening the alternation after an empty result (adding more `|` branches) is the failure signal: switch tools, don't add branches.
+**Key rule:** if `recall` found the right location, `delve` or `get` it —
+don't query again with different terms.
 
-Exact known strings (a specific symbol, error message, or `^export type Foo =`) are correct grep usage. The tell is the `|`: one concept, one string → grep; one concept, many guessed strings → `gogol query`.
+**`bash` is still correct for** (not code search): non-code text (logs,
+`.gitignore`, config), working-tree/git state gogol can't see (`git status`/
+`git diff`, uncommitted edits — verify a hit's on-disk content with `read`),
+git ops, running scripts, `ls`, `wc`. Reading a known file → `read`.
 
-## Explore (default for function investigation)
+## Common params
 
-One-call deep dive. Replaces query + get + calls with a single ~2KB result.
+- **`scope`** — scope to a git repo. Repo *name* (`web` matches any indexed
+  checkout path ending `/web`) or full path, or a parent dir (unions the repos
+  under it). Also triggers on-demand refresh + surfaces notes attached to that
+  path. (A path-shaped scope that doesn't exist errors, like `ls`.)
+- **`ref`** — the same target by its portable root-commit SHA (no filesystem).
+  For a container/machine with no shared checkout. Get it from `status`
+  (`index_list[].root_sha`). `scope` (name/path) and `ref` (SHA) are distinct:
+  a SHA isn't a scope, a name/path isn't a ref. (The old `index` param was
+  retired — `scope` by repo name covers cross-index name collisions.)
+- **`type`** — `note` | `doc` | `code`; omit for all. **`literal` can't find
+  notes** (FTS5 is on cache.db; notes live in notes.db) — use
+  `recall` with `type="note"`.
+
+## Tool details
+
+**recall** — hybrid: 0.6·cosine + 0.4·bm25_norm, then call-graph expansion.
+Output: `score` (blend, for order), `cosine`/`max_cosine` (raw, for
+confidence), `low_confidence`, `via_edge` (true = reached via call graph,
+not text), `indexing`. **Trust `cosine`/`max_cosine`, not `score`** — but a
+low cosine can still be the right hit when scoped+type-filtered; verify from
+the snippet (e.g. a `# session YYYY-MM-DD` header) not the score.
+```jsonc
+mcp__gogol__recall({ "text": "payment capture flow" })                          // all indexes
+mcp__gogol__recall({ "text": "auth token refresh", "scope": "web", "limit": 10 })// one repo
+mcp__gogol__recall({ "text": "config", "type": "doc" })                         // docs only
+mcp__gogol__recall({ "text": "session", "type": "note" })                       // notes only
+```
+
+**delve** — one call: full source + callers + callees + imports. Use when
+you know the function name.
+```jsonc
+mcp__gogol__delve({ "symbol": "processOrder" })
+mcp__gogol__delve({ "symbol": "handleEvent", "scope": "backend" })
+```
+
+**literal** — exact phrase (FTS5). Faster/deterministic vs `recall`. Returns
+file, line, enclosing symbol. **Can't find notes.**
+```jsonc
+mcp__gogol__literal({ "pattern": "useAddItemsToCart" })
+mcp__gogol__literal({ "pattern": "DATABASE_URL" })
+mcp__gogol__literal({ "pattern": "TODO:", "limit": 20 })
+```
+
+**links** — AST call/import graph. `node` = symbol (`processOrder`) for call
+edges, or file path (`docs/api.md`) for import edges. `kind` `call`|`import`.
+`direction` `in`|`out`|`both` (default). `depth=N` + `kind=import` +
+`direction=in` = "affected" (reverse import deps).
+```jsonc
+mcp__gogol__links({ "node": "handleEvent", "kind": "call" })                        // callers + callees
+mcp__gogol__links({ "node": "handleEvent", "kind": "call", "direction": "in" })    // callers only
+mcp__gogol__links({ "node": "src/utils.ts", "kind": "import", "direction": "in", "depth": 3 }) // affected
+```
+
+**related** — embedding-similar entries to a known one (have its `id`).
+`type` `code`|`doc`|`note`; omit for code+doc.
+```jsonc
+mcp__gogol__related({ "id": "<id>", "type": "code" })   // code related to this entry
+mcp__gogol__related({ "id": "<id>", "type": "doc" })    // docs describing this code
+mcp__gogol__related({ "id": "<id>", "type": "note" })   // related notes
+```
+
+**metrics** — rank functions by cyclomatic complexity (refactor candidates).
+Default excludes vendor/node_modules; `filter` (path substring) to scope.
+```jsonc
+mcp__gogol__metrics({ "limit": 20 })
+mcp__gogol__metrics({ "filter": "web/src", "limit": 10 })
+```
+
+**get** / **status** — `get({ "id": "<id>" })` fetches full entry content;
+`status({})` returns store stats.
+
+## Notes (knowledge store)
+
+LLM-authored content of record — durable, not scratch. Join the same
+semantic space as code+docs. Surface in `recall` when query `scope`
+path-prefix-matches the note's scope (omit `scope` for global). **Notes are
+not rebuildable from code** — never overwrite/delete the store to test; the
+binary auto-backs up notes.db daily (Fibonacci-aged {1,2,3,5,8,13} days) as
+a *recovery* mechanism, not a dev workflow.
+```jsonc
+mcp__gogol__remember({ "content": "auth uses JWT in sessionStorage" })                  // global
+mcp__gogol__remember({ "content": "3DS for EU cards", "scope": "/abs/path/to/repo" })  // scoped
+mcp__gogol__forget({ "id": "<id>" })                                                   // remove
+mcp__gogol__remember({ "content": "revised", "consolidate": "<old-id>" })              // replace atomically
+```
+
+## CLI (secondary)
+
+A `gogol` binary exists for shell use (same 10 tools, flag syntax:
+`--scope`, `--ref`, `--type`, `-n`/`--limit`, positional arg). Also has
+`gogol index <path>` to pre-warm and `gogol serve` for a local HTTP MCP
+transport + browser dashboard. **Prefer the MCP tools** — agent-native,
+no shell overhead.
 
 ```bash
-gogol explore "processOrder" --index backend   # full function context
-gogol explore "checkForAlerts" --index backend       # definition + call graph + deps
-gogol explore "handleEvent" -n 30                    # show 30 lines of source
+gogol serve --host 127.0.0.1 --port 7777  # local-only HTTP MCP + status page
 ```
 
-Output: signature, source snippet, file imports, callers, callees (project-only), related symbols.
+## Session resume (cross-session state)
 
-**Use explore when:** you know the function name and need to understand it. Skip query entirely.
-
-For a **doc/markdown** entry, explore instead shows its reference graph (see below).
-
-## Doc references
-
-Markdown links `[text](target)` in `.md` files are extracted into a reference graph and surfaced by `explore` on a doc, and as counts in `query`.
-
-```bash
-gogol explore "OVERVIEW" --index backend --file docs/OVERVIEW.md
-```
-
-Sections in the output:
-- `references:` — local docs this file links to (`<title> → path`, round-trips into `gogol get`)
-- `external references:` — off-index URLs (Jira/GitLab/etc., `<title> ↗ url`) — read with `web_fetch`
-- `referenced by:` — docs that link to this one (reverse graph, local only)
-
-`query` appends a compact `[refs:N ext:M refby:K]` suffix to each doc result (space-separated in agent mode). Only local links that resolve to an indexed file become `references`; unresolvable/out-of-project links are dropped; `://` links become `external references`. The link text is used as the title.
-
-## Query
-
-Semantic + keyword hybrid search with RRF ranking.
-
-```bash
-gogol query "payment capture flow"                   # search all indexes
-gogol query "auth token refresh" --index web -n 10   # specific codebase
-gogol query "error handling" --index backend         # scope to one index
-gogol query "config" --show                          # show code snippets inline
-```
-
-### Query Refinement
-
-When results aren't right:
-
-| Problem | Action |
-|---------|--------|
-| Too noisy / irrelevant hits | Narrow with `--index web` or `--type doc` |
-| Too few results | Broaden terms, try synonyms, drop `--index`/`--type` filters |
-| Right file but wrong function | `gogol get` the location, or `gogol explore` the function name |
-| Need structural context | Switch to `gogol calls` or `gogol explore` |
-
-**Don't:** query → query → query with slightly different terms. Two queries max, then switch strategy.
-
-### Filtering by Type
-
-Restrict results to a single entry type with `--type`:
-
-```bash
-gogol query "auth" --index web              # all types in web index
-gogol query "auth" --type doc --index web   # only file (doc) entries
-gogol query "deploy" --type note            # only memory notes
-gogol query "term" --type term              # only glossary terms
-```
-
-Types: `doc` = file chunk, `note` = memory note, `term` = glossary term. Omit `--type` for all types.
-
-## Calls
-
-AST-extracted call graph. No source reading needed.
-
-```bash
-gogol calls "handleEvent" --index backend            # callers + callees
-gogol calls "processOrder" --depth 3                  # recursive tree (3 levels)
-gogol calls "hashValue" --out                        # only what it calls
-gogol calls "hashValue" --in                         # only who calls it
-```
-
-**Use calls when:** you need to trace execution flow across files without reading them all.
-
-## Affected
-
-Find all files that transitively depend on given files via the import graph.
-
-```bash
-gogol affected "order-hash.ts" --index backend                  # all dependents
-gogol affected "order-hash.ts" --filter "*.test.*"              # only test files
-gogol affected "orders.ts" --filter "e2e/**"                  # only e2e specs
-git diff --name-only | gogol affected --stdin --index backend   # from git diff
-```
-
-## Get
-
-Direct retrieval by location. Use after query/list finds the right entry.
-
-```bash
-gogol get note web auth/flows            # memory note content
-gogol get doc web src/utils.ts:42        # file from line 42 (full)
-gogol get doc web src/utils.ts:42 -n 30  # 30 lines from line 42
-gogol get term backend OMS               # glossary expansion
-```
-
-## Metrics
-
-Function complexity profile for a file.
-
-```bash
-gogol metrics "orders.ts" --index backend
-gogol metrics "order-hash.ts" --index backend
-```
-
-## Knowledge Store
-
-### Store findings during investigation
-
-Don't wait until session end. After understanding something non-trivial (traced a flow, found a gotcha, resolved ambiguity) — store it immediately.
-
-```bash
-# Memory note (works on any index, regardless of mode)
-gogol add note team deploy/k8s "HPA scales on CPU at 70%" --sources "docs/infra.md"
-
-# Glossary term (improves search for abbreviations)
-gogol add term backend OMS "order management system, order processing"
-
-# Multi-line via heredoc
-gogol add note team payments/flow --stdin <<'EOF'
-1. Customer initiates payment
-2. Backend creates a payment provider session
-3. Redirect to the provider hosted page
-EOF
-```
-
-### List and Remove
-
-```bash
-gogol list web                           # all entries in web (all types)
-gogol list note team                     # memory notes
-gogol list term backend                  # glossary terms
-gogol rm note web outdated-topic         # remove memory note
-```
-
-## Entry Types
-
-Every entry is addressed as `<type> <index> <path>`:
-
-| Type | Meaning | Example |
-|------|---------|---------|
-| `doc` | File chunk under an index's configured paths | `doc web src/utils.ts:42` |
-| `note` | Memory note in the index's store | `note web auth/flows` |
-| `term` | Glossary term (term → expansion) | `term web OMS` |
-
-Query output leads with the type token and is copy-pasteable straight into `get`:
+git carries ~60% (landed code, better than any note); a scoped session note
+carries the ~40% git can't see (non-commit actions, open items, lessons).
+At session end write ONE note scoped to the repo (`scope` = `git rev-parse
+--show-toplevel`), in this exact shape (the shape is the contract — anchors
+are greppable):
 
 ```
-doc  web src/auth/token.ts:42 § handleLogin
-note web auth/session-notes
-term web JWT
+# session YYYY-MM-DD — <one-line repo state>
+Supersedes: <prior-session-note-id, or none>
+
+## Landed (see git log <base>..HEAD)
+<highlights only — one or two lines. git is authoritative; don't re-list every commit.>
+
+## Non-commit state (NOT in git)
+- <recoveries, filesystem actions, other-repo changes, anything git can't see>
+
+## Open
+- <item> → next: <concrete next step>
+
+## Lesson
+- <omit if none; required after a prod incident or genuine surprise>
 ```
 
-## Output Format
+**Resume:** find the current (unsuperseded) note. **Use `recall`, not
+`literal`** — notes have no FTS index; `recall`'s semantic arm hits
+`notes_vec`. ONE scoped query with the full anchor (don't run unscoped
+first, don't weaken it):
+```jsonc
+mcp__gogol__recall({ "text": "session Supersedes none", "scope": "/abs/path/to/repo", "type": "note" })
+mcp__gogol__get({ "id": "<id>" })   // then read the full note
+```
+Session notes often score low cosine (`low_confidence: true`, `max_cosine
+~0.5`) because the anchor is short — trust a hit whose snippet starts with
+`# session YYYY-MM-DD` regardless of score. **Then stop investigating and
+resume:** read the note, summarize its state (Landed/Non-commit/Open/Lesson)
+to the user, ask which open item to tackle. The note IS the resume — don't
+audit it. No git reconciliation, no reading untracked files, no hunting
+supersession chains. Resume = find, read, summarize, ask. Anything beyond
+that is the spaz.
 
-Auto-selects agent mode when piped. Override: `gogol --format=agent` or `--format=default`.
-Path control: `--path full|abs|short` (`--abs` is alias for `--path abs`).
-
-## Context Efficiency
-
-gogol results are ~500-2000 chars per call. For comparison:
-- `grep`: ~500-1100 chars but requires follow-up reads
-- `read` tool: ~1600-8400 chars per file section
-
-**One `explore` call (~2KB) replaces a query + get + calls sequence (~4-6KB total).** Prefer explore when you know the function name.
+**Lifecycle:** when you write a new session note, `Supersedes: <old-id>` it
+and replace the prior with `remember(..., consolidate: "<old-id>")` — so "current
+state" = the one note with `Supersedes: none`. The old note is archived, not
+hard-deleted: `recall` hides it because its `notes_vec` row is removed, but `get`
+still resolves the old id and the chain remains walkable.
+```jsonc
+mcp__gogol__remember({ "content": "<new session note>", "consolidate": "<old-id>" })
+```

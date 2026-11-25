@@ -6,72 +6,54 @@ Development guide for AI agents working on gogol.
 
 ```
 gogol/
-├── CMakeLists.txt          # Build config, links llama + ggml + tree-sitter
+├── CMakeLists.txt          # Build config (llama + ggml + tree-sitter + sqlite/sqlite-vec)
 ├── src/
 │   ├── cli/
 │   │   ├── main.cpp           # CLI entry point + arg parsing
 │   │   ├── commands.h         # Args struct + command declarations
-│   │   ├── cmd_query.cpp      # query + list commands
-│   │   ├── cmd_calls.cpp      # calls + metrics + affected
-│   │   ├── cmd_crud.cpp       # index, add, rm, get, status, sync, prune
-│   │   └── cmd_explore.cpp    # explore (composite: source + callers + callees + imports + related)
+│   │   ├── cmd_store.cpp      # All subcommands (recall, delve, links, metrics, etc.)
+│   │   ├── git_identity.cpp/h # Git worktree/common_dir resolution
 │   ├── core/
-│   │   ├── types.h            # Shared types (FunctionMetrics)
-│   │   ├── version.h/cpp      # Build version (git describe, checked on daemon connect)
-│   │   ├── call_graph_query.cpp/h # Shared call graph query helper (used by cmd_calls + cmd_explore)
-│   │   ├── indexer.cpp/h      # Index pipeline (shared by CLI + daemon)
-│   │   ├── searcher.cpp/h     # Search pipeline (shared by CLI + daemon)
-│   │   ├── operations.cpp/h   # Shared add/rm/get logic (shared by CLI + daemon)
-│   │   ├── format.cpp/h       # Output formatting (print_result, format_index_summary)
-│   │   └── loc.cpp/h          # Location parsing + formatting
+│   │   ├── refresh.cpp/h      # On-demand repo indexing (resync_disk_index, refresh_repo)
+│   │   ├── result_formatters.cpp/h # Unified recall-result formatting (CLI + MCP share it)
+│   │   └── types.h            # Shared types (FunctionMetrics)
 │   ├── adapters/
-│   │   ├── adapter.h          # Base adapter interface
-│   │   ├── file_adapter.cpp/h # file — disk scan, chunk, enrich, staleness
-│   │   └── mem_adapter.cpp/h  # mem — .mem store, add/remove
+│   │   ├── adapter.h          # AdapterChunk (the chunk type produced by a scan)
+│   │   └── file_adapter.cpp/h # Disk scan + chunk + enrich (the only backend)
 │   ├── chunking/
 │   │   ├── chunker.cpp/h      # Window fallback chunker
-│   │   ├── chunker_iface.cpp/h# IChunker interface + registry
-│   │   └── ts_chunker.cpp/h   # Tree-sitter AST chunker (chunks, calls, imports, exports, types, metrics)
+│   │   ├── chunker_iface.cpp/h# IChunker interface + registry + default_index_extensions
+│   │   └── ts_chunker.cpp/h   # Tree-sitter AST chunker (chunks, calls, imports, metrics)
+│   ├── store/
+│   │   ├── store.cpp/h        # Unified SQLite store (cache.db + notes.db)
 │   ├── storage/
-│   │   ├── db.cpp/h           # SQLite RAII wrapper (Db/Stmt/Tx, WAL, user_version) — LIVE store
-│   │   ├── sqlite_backend.cpp/h # SqliteBackend: one <index>.db per index (sole backend)
-│   │   ├── storage_backend.h  # StorageBackend interface + open_backend() factory
-│   │   ├── index_file.cpp/h   # Index/IndexEntry types, cosine + f16 helpers
-│   │   ├── call_store.cpp/h   # Call-graph edge types + query helpers
-│   │   ├── import_store.cpp/h # Import graph types + query helpers
-│   │   ├── docref_store.cpp/h # DocRef graph types + resolve_doc_ref
-│   │   ├── export_store.cpp/h # Exported symbols types + query helpers
-│   │   ├── type_store.cpp/h   # Type hierarchy edge types
-│   │   ├── metrics_store.cpp/h# Function complexity metrics types
-│   │   ├── mem_store.cpp/h    # Mem entry content persistence
-│   │   └── glossary_store.cpp/h # Per-index glossary persistence
+│   │   ├── db.cpp/h           # SQLite RAII wrapper (Db/Stmt/Tx, WAL)
+│   │   └── index_file.cpp/h   # f16 <-> f32 conversion helpers
 │   ├── embedding/
 │   │   ├── embedder.cpp/h     # llama.cpp wrapper
-│   │   ├── embed_dispatcher.cpp/h # Single-thread embed queue (owns llama context)
-│   │   └── embed_provider.h   # Abstract embedding interface
-│   ├── daemon/
-│   │   ├── embed_server.cpp/h # Daemon (holds all state, handles RPC)
-│   │   ├── embed_client.cpp/h # RPC client for CLI
-│   │   ├── rpc.h              # RPC command/status enums + request types
-│   │   ├── rpc_v2.cpp/h       # Framed wire protocol + encryption
-│   │   └── file_watcher.cpp/h # FSEvents/inotify file watching
+│   │   ├── embed_provider.cpp/h # Warm singleton embedder (loads once per process)
+│   │   └── model_prefixes.cpp/h # arch -> query/document retrieval prefix table
 │   ├── mcp/
-│   │   ├── mcp_server.cpp/h   # MCP stdio JSON-RPC 2.0 server (gogol mcp)
+│   │   ├── mcp_server.cpp/h   # JSON-RPC 2.0 dispatch (stdio `gogol mcp`); tool handlers
+│   │   ├── http_server.cpp    # `gogol serve`: POST /mcp + GET / live status dashboard
+│   │   ├── message_bus.cpp/h  # agent message bus (send/receive/ack/peek/presence/listen)
+│   │   ├── message_store.cpp/h# messages.db queue behind the bus (ADR-003)
 │   │   ├── tool_registry.cpp/h# Tool catalog + schema (single source of truth)
 │   │   └── json.h             # Minimal JSON value/serializer
 │   └── config/
-│       ├── config.cpp/h       # INI parser, IndexMode
-│       ├── scanner.cpp/h      # Recursive file discovery
-│       └── utils.h            # split_csv, count_entries
+│       ├── config.cpp/h       # INI parser (~/.gogol/config)
+│       ├── scanner.cpp/h      # Recursive file discovery + git_index_name + repo_tag
+│       └── debug.h            # Debug logging macros
 ├── tests/
-│   ├── test_all.cpp           # Unit tests (no llama.cpp dependency)
-│   └── test_ts_chunker.cpp   # Tree-sitter chunker tests
+│   ├── test_all.cpp           # Unit tests (93 tests, no llama.cpp dependency)
+│   └── test_ts_chunker.cpp    # Tree-sitter chunker tests (12 tests)
 └── vendor/
-    ├── llama.cpp/             # Git submodule
-    ├── monocypher/            # Encryption (XChaCha20-Poly1305)
+    ├── llama.cpp/             # Git submodule (embeddings)
+    ├── sqlite/ sqlite-vec/    # Vendored SQLite + vec0 ANN extension (source)
+    ├── json/ CLI11/           # Vendored JSON + arg-parsing (source)
+    ├── monocypher/            # BLAKE2b for content hashing (vendored source)
     ├── tree-sitter/           # Git submodule
-    ├── tree-sitter-cpp/       # C++ grammar
-    └── tree-sitter-*/         # Language grammars (submodules)
+    └── tree-sitter-*/         # Language grammars (submodules: typescript, python, go, rust, c, cpp, php, gdscript)
 ```
 
 ## Build
@@ -84,335 +66,204 @@ cmake --build build --target gogol -j$(sysctl -n hw.ncpu)
 
 ## Development conventions
 
-Follow these when writing C++ for gogol (an AI agent working on this repo should treat
-these as the house style — they are enforced in review):
+### ⚠️ NEVER touch the production database
+
+`~/.gogol/cache.db` and `~/.gogol/notes.db` are **PRODUCTION DATA**. The notes are
+LLM-authored content of record — they are NOT rebuildable from code. Deleting or
+overwriting them is irreversible data loss.
+
+**ALL development, debugging, and testing MUST happen in an isolated environment.**
+No exceptions, no "just this once". Specifically:
+
+- **Never** `rm`, `>`, or overwrite `~/.gogol/cache.db` or `~/.gogol/notes.db`.
+- **Never** run `gogol index`, `gogol remember`, or any write command against the
+  live store when testing a code change. Use a throwaway `GOGOL_HOME`:
+  ```bash
+  export GOGOL_HOME=$(mktemp -d)   # isolated cache + notes live here, not ~/.gogol
+  # ... test ...
+  rm -rf "$GOGOL_HOME"             # throw away the whole isolated store
+  ```
+  If the binary doesn't honor `GOGOL_HOME` yet, copy the DBs to a temp location
+  first and point your test at the copy — never at the originals.
+- **Back up BEFORE any operation that could touch prod data** — not after. A backup
+  taken after a wipe is worthless. `cp ~/.gogol/notes.db ~/.gogol/notes.db.bak`
+  is the first command, before anything else.
+- If a reproduction needs a real index, build it in the isolated `GOGOL_HOME`, not
+  by re-indexing into the live store.
+- Debugging a store/query bug? Reproduce in the isolated store. Add `fprintf(stderr)`
+  to the binary, rebuild, run against the copy. Never mutate prod to see what happens.
+
+The cache.db side is derived/rebuildable (re-indexing regenerates it), but notes.db
+is not. Treat both as untouchable during development.
+
+**Safety net:** gogol auto-backs up notes.db once per calendar day into
+`gogol_home()/backups/YYYY-MM-DD/`, keeping a Fibonacci-aged set {1,2,3,5,8,13}
+days. This protects against the exact failure above (notes.db overwrite) for the
+prod home. It is NOT a license to be careless — isolated `GOGOL_HOME` for dev is
+still mandatory. The backup is a recovery mechanism, not a development workflow.
 
 ### Build & verify loop
 - Build: `cmake --build build --target gogol -j$(sysctl -n hw.ncpu)`
 - Reconfigure when adding source files: `cmake -B build -DCMAKE_BUILD_TYPE=Release`
   (add the `.cpp` to BOTH the `gogol` and `gogol-tests` targets in CMakeLists.txt).
-- Tests: `./build/gogol-tests` (unit, no llama dep) and `./build/gogol-ts-tests`
-  (tree-sitter). Every change must keep both green.
+- Tests: `./build/gogol-tests` (unit) and `./build/gogol-ts-tests` (tree-sitter).
+  Every change must keep both green.
 - Add a unit test in `tests/test_all.cpp` for new logic — style is
   `void test_xxx() { TEST(xxx); ... assert(...); PASS(); }`, registered in `main`.
 
 ### Code style
-- **RAII everywhere.** No manual resource cleanup. e.g. `Db`/`Db::Stmt`/`Db::Tx`
-  wrap sqlite handles; a prepare always has a finalize via the wrapper's dtor.
-- **Non-throwing filesystem IO.** Use the `std::error_code` overloads and return
-  `false`/handle the error — do NOT let an exception escape. llama.cpp installs a
-  global `std::set_terminate` → `abort()`, so any uncaught exception kills the whole
-  daemon. RPC dispatch, the watcher callback, and the async index thread wrap their
-  bodies in try/catch.
-- **Atomic writes** for file stores: write to `path.tmp`, then `rename` (`atomic_write`).
-- **Bound parameters, never string-concatenated values** in SQL (`sqlite3_bind_*` /
-  `Db::Stmt::bind`). Concatenation is only acceptable for integer PRAGMA args.
-- **Vendor dependencies as source** in `vendor/` (compiled directly, like
-  `monocypher.c`, `sqlite3.c`, `sqlite-vec.c`) — zero external/runtime deps.
+- **RAII everywhere.** No manual resource cleanup. `Db`/`Db::Stmt`/`Db::Tx` wrap sqlite handles.
+- **Non-throwing filesystem IO.** Use `std::error_code` overloads and return `false`/handle the error.
+- **Bound parameters, never string-concatenated values** in SQL (`sqlite3_bind_*` / `Db::Stmt::bind`).
+- **Vendor dependencies as source** in `vendor/` (compiled directly — zero external/runtime deps).
 
-### Patterns to reuse (don't reinvent)
-- **Adapter** (`Adapter`, `StorageBackend`) — swappable behind a factory; callers
-  depend on the interface, never a concrete backend or on-disk format.
-- **Registry** (`default_chunkers()`, `default_ref_extractors()`) — adding a new
-  chunker/extractor is one class + one registry line; the pipeline iterates the list.
-- **Codec / delegation** — a backend DELEGATES to existing serialization; never
-  duplicate an on-disk format. `SqliteBackend` reuses the keyword + f16 embedding
-  serializers rather than reimplementing them.
-- **`_locked` helper split** for transactions — public `save_*` opens a `Db::Tx` and
-  calls a no-tx `*_locked` helper; `save_all` opens ONE tx and calls every helper
-  (SQLite has no nestable BEGIN, and the SQL lives only in the helpers — no dup).
-
-### Refactor discipline (proven in the storage epic)
-- Prefer small, behavior-preserving steps, each independently buildable + tested.
-- Make a **checkpoint commit** after each safe step so there's always a return point.
-- For non-trivial work, delegate implementation to sub-agents and have an
-  INDEPENDENT auditor sub-agent verify (build, tests, behavior parity, no over-removal)
-  before accepting — do not trust a stage's self-report.
-- Capture design decisions as a doc under `docs/design/` (see
-  `docs/design/storage-architecture.md`), and the feature set as notes in the `gogol`
-  index (`gogol query "<topic>" --index gogol --type note`, spine at
-  `note gogol features/overview`).
+### Patterns to reuse
+- **Registry** (`default_chunkers()`) — adding a new chunker is one class + one registry line.
+- **Content-addressable identity** — `id = content_id(content)` (BLAKE2b hash, 16 hex chars).
 
 ## Architecture
 
-### Adapter pattern
+### Daemon-less, zero-config
+- No background process. The embedding model loads on first use (~2s) and stays warm.
+- Auto-indexes git repos on query. No manual index commands or config sections per repo.
+- HTTP transport: `gogol serve` adds a `POST /mcp` JSON-RPC endpoint and a live `GET /`
+  status dashboard. Binds `127.0.0.1` by default; `--host 0.0.0.0` exposes it (NO AUTH —
+  only for same-host/trusted use, e.g. containers on the docker bridge). stdio
+  (`gogol mcp`) remains the default transport.
+- Git identity: `idx = root commit SHA` (worktree/clone/move-stable). Worktrees share an index.
 
-Each protocol implements the `Adapter` interface:
+### Agent message bus (`gogol serve`)
+gogol serve doubles as a broker for agent-to-agent messaging between coding-agent
+sessions (host or container) over the unix socket or HTTP. See `src/mcp/message_bus.{h,cpp}`.
+- **Persistent, at-least-once (ADR-003).** Queues live in `gogol_home()/messages.db`
+  (`MessageStore`), opened only by the daemon under its flock. Condvars, presence and
+  counters stay in RAM. Durable content still belongs in a gogol note the message points at.
+- **Tools** (same registry/dispatch recipe as every other tool). Hidden from tools/list:
+  `receive(me, timeout_ms?,
+  consume?, session?)` (long-poll on a per-name condvar; serve is thread-per-connection),
+  `ack(me, seq)`, `peek(me)`, `presence(name, online?)`. Listed only with `[mcp] messaging
+  = true`: `listen(name)` and `send(to, body, me?, from?, with_context?, ref?, context_limit?)`.
+- **Messaging over MCP** (`[mcp] messaging = true`, default off): for MCP-only harnesses
+  (Vibe). Identity is an explicit handle, not connection state (MCP 2026-07-28 removed
+  sessions, SEP-2567): `listen(name)` returns `me`; the caller (usually a client hook)
+  passes `me` on later calls. `send` signs with `me` over `from`. Any tools/call carrying
+  `me` gets an extra text block "📟 N unread messages for <me> (from: …)" when its inbox
+  has queued messages, once per change (`MessageBus::unread_hint`). Delivery stays a
+  client concern (receive with `session`, ack); the hint only says mail is waiting.
+  No auth: any caller can pass any `me`; fine on one trusted host only.
+- **Delivery**: `receive` without `session` consumes on receive. With `session` it claims
+  the row (redelivered until `ack`) and first requeues claims of the name's other
+  sessions. Daemon start requeues all claims; an hourly sweep requeues claims older than
+  1h and prunes delivered rows older than 30 days. Per-inbox cap 1000 queued (drop
+  oldest). seq is a persistent AUTOINCREMENT, never reused; clients dedupe by it.
+- **Semantic context on send**: `send(with_context=true, ref=<root-sha>)` reuses the recall
+  path (`handle_store_query`) to attach top-k hits to the message, so the recipient arrives
+  pre-loaded and skips its own search turns. `ref` is a portable identity (no shared fs).
+- **Observability**: `status` emits a `bus` section (agents, online, total_sent, queued,
+  per-agent sent/received/inbox_depth/last_seen); the `GET /` dashboard renders it live
+  (3s poll) in an Agents panel.
+- **Auth/encryption**: none yet — deferred until the broker is exposed beyond a trusted
+  host. Clients are thin: they call the bus tools over the socket or POST /mcp.
 
-```cpp
-class Adapter {
-  virtual string protocol() = 0;        // "file" or "mem"
-  virtual vector<AdapterChunk> scan(bool force, map<string,uint64_t>& hashes) = 0;
-  virtual EntryStatus check_stale(const string& key, uint64_t hash) = 0;
-  virtual string get_content(const string& key, uint32_t line, int max_lines) = 0;
-  virtual bool add(const string& key, const string& content, const vector<string>& sources);
-  virtual bool remove(const string& key);
-};
-```
-
-- **FileAdapter** — scans disk, chunks via IChunker chain, enriches embed text, stat-hash staleness
-- **MemAdapter** — manages .mem store, timestamp-based staleness
-
-### Shared operations (core/operations.cpp)
-
-Type dispatch is centralized in three functions:
-- `op_add(type, index, path, content, sources, config, embedder, index)` — handles doc, note, term
-- `op_rm(type, index, path, config, index)` — handles doc, note, term
-- `op_get(type, index, path, config)` — handles doc, note, term
-
-Both CLI (cmd_crud.cpp) and daemon (embed_server.cpp) call these. Adding a new entry type only requires changes to `operations.cpp` + `loc.cpp`.
-
-### Chunker interface
-
-```cpp
-class IChunker {
-  virtual bool supports(const string& ext) = 0;
-  virtual vector<Chunk> chunk(const string& content, const string& path) = 0;
-};
-```
-
-Chain order (first match wins):
-1. User-defined regex chunkers from `[chunkers]` config section
-2. Built-in RegexChunker: Markdown (`^#{1,2} ` headings)
-3. TreeSitterChunker: TS, TSX, Python, Go, Rust, C, C++, PHP
-4. Built-in RegexChunker: GraphQL, YAML, SQL
-5. WindowChunker: fixed 2000-char window (universal fallback)
-
-### Embedding enrichment
-
-Each code chunk's embedding text is enriched via `enrich_embed_text()` in file_adapter.cpp:
-
-```
-{directory_context} (also: {sibling_headings}): {path} § {heading}. {code} [{split_identifiers}] {glossary_expansions}
-```
-
-Techniques (all zero-cost, no LLM):
-- **Directory context** — last 2 meaningful path segments
-- **Sibling headings** — other chunk headings from same file, capped at 200 chars
-- **Identifier splitting** — camelCase/snake_case → words
-- **Glossary expansion** — matched glossary terms for the index appended
-- **Import exclusion** — import statements not indexed (~35% size reduction)
-
-### Daemon (gogol serve)
-
-Holds all state in memory:
-- Embedding model (GPU-accelerated) — owned by EmbedDispatcher worker thread
-- All indexes + keyword indexes
-- Accepts RPC commands via unix socket + optional TCP
-- Optional file watcher: auto-reindex on filesystem changes (FSEvents/inotify)
-
-Architecture: thread-per-connection (accept loop spawns a handler thread per client, tracked in a registry) + single writer thread (WriteQueue) + single embed thread (dispatcher). The embed thread owns the llama.cpp context (not thread-safe). Handlers read immutable snapshots lock-free and submit writes to the queue, so concurrent clients are served simultaneously; a slow query or a `submit_wait` (rm/glossary) on one connection no longer stalls others. rm/get/status/list never block on embedding.
-
-Exception safety: llama.cpp installs a global `std::set_terminate` handler that calls `abort()`, so any uncaught exception anywhere in the process kills the whole daemon. To contain this, the RPC dispatch, the file-watcher reindex callback, and the async index thread each wrap their body in try/catch and convert failures to an error response / log line. Filesystem helpers (`atomic_write`, `create_directories` in adapters and stores) use the `error_code` overloads and return `false` instead of throwing.
-
-Concurrency (immutable snapshots): `DaemonState` holds each index as a `shared_ptr<const Index>` (and kw index as `shared_ptr<const KeywordIndex>`). Readers (query/list/status) grab a stable snapshot under a brief lock, then read it lock-free — the snapshot stays alive via refcount even if a writer swaps concurrently. Writers (index/add/rm/watcher) deep-copy the current snapshot (`mutable_copy`), mutate the copy, then atomically publish it (`publish`). No lock is held during the expensive reindex/search work. This makes the data-race SIGSEGV class (a reader touching a half-swapped `entries`/`embedding` vector) unrepresentable rather than merely avoided at known sites. Embeddings are materialized (`ensure_embeddings`) on the mutable copy before publishing, so a `const` snapshot is never lazily mutated. There is no coarse per-request lock, so a slow query no longer blocks other clients, and RM no longer self-deadlocks.
-
-Single writer (`WriteQueue`, `daemon/write_queue.h`): all in-memory index mutations run on one owner thread. INDEX/ADD/RM/watcher submit jobs; each job does the `mutable_copy → mutate → publish` sequence. Because only the writer thread mutates, the snapshot a job copies is always the latest published one — there is no lost-update window between concurrent writers. `submit()` is fire-and-forget (async index, mem-add publish); `submit_wait<T>()` blocks for a result (rm, glossary add) so the client still gets a synchronous ack. The `.mem` and glossary *store* writes also run on the writer thread now (mem-add writes `.mem` inside the same job that publishes the index; glossary/rm run under `submit_wait`), so the stores are single-owner and can't lose updates. Embedding still routes through `EmbedDispatcher` (sole llama-context owner); the writer thread blocks on those embeds without deadlock (the dispatcher serializes writer and query embeds on its own thread).
-
-Thread-per-connection: the accept loop spawns a handler thread per client (tracked in a `HandlerRegistry`), so a handler blocking on `submit_wait` (rm/glossary) or a slow query no longer prevents `accept()` or stalls other clients. This is safe because reads use immutable snapshots and all writes are serialized on the single writer thread — handler threads never mutate shared state directly. `indexing_name` (read by STATUS on a handler thread, written by the writer thread) is guarded by a small mutex; other status fields are atomics. Finished threads are reaped (joined) each accept tick to bound registry growth. On shutdown the daemon stops accepting, calls `shutdown(SHUT_RDWR)` on each still-running client fd to unblock any handler stuck in `read()`, then joins all handler threads before destroying state — no detached threads, no use-after-free, no bounded-timeout guesswork. The listen backlog is 128 (was 8) to absorb connection bursts.
-
-Version check: client sends PING on connect, daemon returns build version. If mismatch, the client prints restart instructions and exits (there is no direct-mode fallback).
-
-CLI commands connect to the daemon over the unix socket. Direct/standalone mode was removed: read/write commands (query, add, rm, get, list, index) require a running daemon and print `No gogol daemon running. Start it with: gogol serve` if it isn't up. `status` still works standalone (reads index-file headers) as a diagnostic. The call-graph read commands (calls, metrics, affected, explore) read the auxiliary TSV stores directly since they have no daemon RPC and never mutate.
-
-Network: `gogol serve --tcp 0.0.0.0:9400` enables TCP. Encrypted with XChaCha20-Poly1305 when `[keys]` section exists in config. Client uses `GOGOL_HOST`, `GOGOL_KEY_NAME`, `GOGOL_KEY` env vars.
-
-File watching: on by default (`watch = true` in `[global]`); overridable per index (an index's own `watch` / `watch_debounce_ms` wins). Daemon monitors indexed paths, debounces changes, triggers incremental reindex. Branch switches handled naturally.
-
-RPC commands: PING (returns build version), SHUTDOWN, QUERY, ADD, RM, GET, LIST, INDEX, STATUS.
-
-Daemon returns structured data (raw fields per result). Client handles all output formatting locally — path modes, format selection, tree rendering. This means format changes never require protocol changes.
-
-### MCP server (gogol mcp)
-
-`gogol mcp` runs a Model Context Protocol server over stdio (JSON-RPC 2.0), so
-agents call gogol operations as native tools. Architecture:
-
-- **`mcp/tool_registry.cpp`** is the single source of truth: each tool is one
-  `ToolDef` (name, description, param schema, `read_only`). The tools/list JSON
-  Schema, tools/call validation, and dispatch all derive from it — adding a tool
-  touches only its `ToolDef`.
-- **`mcp/mcp_server.cpp`** is protocol glue (initialize / tools/list / tools/call)
-  and reuses the existing search/call-graph logic; read tools connect to the
-  daemon over the unix socket exactly like the CLI.
-- **Config-gated**: off unless `[mcp] enabled = true`. `tools = read` (default)
-  exposes read-only tools; `tools = read-write` additionally exposes the write
-  tools. Only `enabled` and `tools` are parsed today.
-- Read-only tools: `query`, `explore`, `calls`, `affected`, `get`, `list`,
-  `set_scope`. Write tools (gated): `add_note`, `add_term`.
-- Sessions are per-connection (default index/type scope, result cursors); state
-  lives in the `gogol mcp` process, not the daemon.
-
-### Entry types
-
-Every entry is addressed as `<type> <index> <path>`:
-
-- `doc web src/utils.ts:42 § heading` — file chunk (under the index's configured paths)
-- `note web auth/flows` — memory note (in the index's store)
-- `term web OMS` — glossary term (term → expansion)
-
-`add`, `get`, and `rm` take the type as the first argument. `list` and `query` take an optional type (positional for `list`, `--type` for `query`); omitted means all types.
-
-### Index format
-
-Each index is a single SQLite database at `~/.gogol/indexes/<name>.db` (WAL,
-`synchronous=FULL`, `application_id` = gogol magic, `user_version` = indexer
-schema version). One transaction persists the whole index. Tables: `entries`
-(metadata + embedding BLOB), `notes`, `glossary`, a unified `edges` table
-(call/import/docref/type), `exports`, `metrics`, and an `entries_fts` FTS5
-virtual table for keyword search. See `docs/design/storage-architecture.md` for
-the full schema.
-
-- **Embeddings** are a per-entry BLOB (f16 or f32 per `precision`), loaded into
-  memory at startup for cosine search.
-- **Precision**: 0=f32 (4 bytes/dim), 1=f16 (2 bytes/dim). Set via
-  `precision = f16` in config.
-
-**No legacy layout support.** Older indexes once used split per-file stores
-(`.meta`/`.emb` + `.kw`/`.calls`/`.imports`/… TSVs). Those formats and the
-auto-migration flow were removed; the sole on-disk format is now `<name>.db`.
-An index in an old layout must be re-created with
-`gogol index --index <name> --force`.
-
-### Type filter
-
-Query and list can restrict results to a single entry type:
-
-```bash
-gogol query "auth" --index web              # all entries in web (all types)
-gogol query "auth" --type doc --index web   # only file (doc) entries
-gogol query "deploy" --type note            # only memory notes
-gogol query "term" --type term              # only glossary terms
-gogol list note web                         # only memory notes in web
-```
-
-`query` takes `--type doc|note|term`; `list` takes an optional positional type (`gogol list <type> <index>`). Omitted means all types.
-
-## Configuration
-
-`~/.gogol/config`:
-
+### Config (`~/.gogol/config`) — bare minimum
+Fully optional. Everything auto-detects; a config only *overrides*. The whole file:
 ```ini
 [global]
-model = ~/models/nomic-embed-text-v1.5.Q8_0.gguf
-watch = true
-
-[web]
-path = ~/projects/web
-ext = md,ts,tsx
-mode = r
+model = ~/.gogol/models/<model>.gguf   # optional: else GOGOL_MODEL env, else ~/.gogol/model symlink
+# query_prefix / document_prefix        # optional OVERRIDE; omit to auto-select from model arch
+[mcp]
+enabled = true                         # start `gogol mcp` (default: off)
+messaging = false                      # agent messaging over MCP: listen/send + unread hint
+http_host = 127.0.0.1                   # HTTP bind for `gogol serve` (0.0.0.0 to expose; NO AUTH)
+http_port = 7777                        # HTTP port for `gogol serve` (0 disables)
 ```
+- **Retrieval prefixes auto-select** from the model's GGUF `general.architecture`
+  (nomic-bert / bert / e5 — see `src/embedding/model_prefixes.cpp`); set the keys only
+  for an unknown/custom model. **Context length, embedding dim, pooling** are read from
+  the model. No `precision` / `tcp` / `watch` / per-`[index]` keys — those were culled
+  (an old config still containing them is ignored, not errored).
 
-### Modes
+### Two-DB split (cache.db + notes.db)
+- **cache.db**: Derived/rebuildable data — code/doc entries, embeddings, call graph, FTS.
+- **notes.db**: LLM-authored notes (content of record). Never touched by cache rebuilds.
 
-| Mode | `add doc` | `add note` / `add term` |
-|------|-----------|-------------------------|
-| `r` | Rejected (`Index is read-only`) | Writes into gogol's store |
-| `rw` | Write file + embed immediately | Writes into gogol's store |
+### Store schema (cache.db)
+```sql
+-- idx = repo ROOT COMMIT SHA (content-derived identity); source = repo-RELATIVE path.
+entries (id, content, embedding, source, idx, root_sha, line, end_line, symbol, complexity, ...)
+entry_sources (entry_id, toplevel, source)  -- worktree visibility; toplevel = absolute checkout root
+file_hashes (idx, source, hash)             -- incremental sync; (idx, source) key (relative source)
+edges (kind, src_sym, dst_sym, idx, file)   -- call/import graph; file = relative
+ref_sightings (root_sha, path, last_seen, overlay)  -- location layer: ref -> on-disk paths + overlay flag
+entries_fts (content, symbol)               -- FTS5 keyword search
+entries_vec (id, embedding float[768])      -- sqlite-vec vec0 ANN (cosine KNN)
+```
+Identity = root SHA (worktree/clone/move-stable); location = absolute paths in
+`entry_sources.toplevel` + `ref_sightings.path`, reconstructed at query time. See
+`docs/DESIGN-identity-and-location.md`. Transition migrations (M1–M7): removed once all
+stores were migrated — `docs/MIGRATIONS.md` is now a historical record.
 
-`note` and `term` entries are always writable regardless of mode (they live in gogol's own internal stores). Only `doc` entries require an `rw` index.
+### Worktree support
+- Same content in main + worktree = one entry row, multiple `entry_sources` rows.
+- Query scopes to a toplevel via `entry_sources` join — each checkout sees only its files.
 
-## Adding a new entry type
-
-1. Update `loc.cpp` — parsing logic for the new type
-2. Update `loc.h` — add field to `ParsedLoc`, add format function
-3. Update `operations.cpp` — add case in `op_add`, `op_rm`, `op_get`
-4. Update LIST handler in `cmd_query.cpp` and `embed_server.cpp`
-5. Add storage backend if needed (like `glossary_store.cpp`)
-
-## Adding a new subcommand
-
-1. Add handler in the appropriate `src/cli/cmd_*.cpp` file
-2. Register CLI option in `src/cli/main.cpp`
-3. Add daemon RPC handler if needed (`src/daemon/embed_server.cpp`)
-4. Add client method if needed (`src/daemon/embed_client.cpp`)
-
-## Adding a new chunker
-
-1. Create class implementing `IChunker` in `src/chunking/`
-2. Add to `default_chunkers()` in `chunker_iface.cpp` (order matters — first match wins)
-
-Or add a regex pattern in `[chunkers]` config section (no code change needed).
-
-## Adding a new tree-sitter grammar
-
-1. `git submodule add` the grammar repo into `vendor/`
-2. Add its `parser.c` to `ts-grammars` in CMakeLists.txt
-3. Add `extern "C"` declaration in `ts_chunker.cpp`
-4. Add extension mapping in `get_language()`
+### Hybrid search
+- ARM 1: Cosine similarity (semantic), range [0,1]
+- ARM 2: FTS5 keyword search (BM25)
+- Fused via **weighted blend** (A3): `score = 0.6·cosine + 0.4·bm25_norm`, where bm25 is
+  min-max normalized within the result set. Hits present in only one arm score 0 for the
+  missing arm. Chosen over plain RRF after an 8-trial known-item eval (recall@1 +19pts,
+  MRR +0.10) — rank-only fusion discards the magnitude that separates near-ties when
+  cosine scores cluster (observed avg top-10 spread ~0.077). Weights are tunable
+  constants (`W_SEM`/`W_KW`) in `query_hybrid`.
+- Call-graph expansion adds structurally-related code (marked `via_edge: true`)
 
 ## Testing
 
 ```bash
-./build/gogol-tests        # unit tests (62 tests)
-./build/gogol-ts-tests     # tree-sitter tests (10 tests)
+./build/gogol-tests        # 93 unit tests
+./build/gogol-ts-tests     # 12 tree-sitter tests
 
-# Integration (requires model + daemon)
-gogol serve
-gogol index --index web
-gogol query "auth" -n 3
-gogol query "auth" --path short              # filename:line format
-gogol query "auth" --path abs                # absolute paths
-gogol query "auth" --index web               # scope to web index
-gogol query "auth" --type doc --index web    # only file (doc) entries
-gogol query "deploy" --type note             # only memory notes
-gogol add note private test "content"
-echo "multi-line" | gogol add note private test2 --stdin
-gogol add note private test3 -f ~/notes.md
-gogol get note private test
-gogol get note private test -n 5             # limit lines
-gogol rm note private test
-gogol add term private API "application programming interface"
-gogol get term private API
-gogol rm term private API
-gogol calls "processOrder" --index backend
-gogol calls "hashValue" --index backend --depth 2
-gogol calls "hashValue" --index backend --out   # callees only
-gogol calls "hashValue" --index backend --in    # callers only
-gogol metrics "orders.ts" --index backend
-gogol metrics "orders.ts" --index backend --path abs
-gogol explore "processOrder" --index backend
-gogol explore "checkForAlerts" --index backend -n 30
-gogol affected "order-hash.ts" --index backend
-gogol affected "order-hash.ts" --index backend --filter "*.test.*"
-echo "order-hash.ts" | gogol affected --stdin --index backend
-gogol list web
-gogol list web --path short
-gogol status
-gogol serve --stop
+# Integration (with model)
+cd ~/projects/myrepo
+gogol recall "auth"
+gogol delve processOrder
+gogol links handleEvent --kind call
+gogol metrics --limit 10
+# Repo scoping (ONE selector set everywhere — no --index): --scope <name|path>, --ref <sha>.
+# Default is the CWD's repo; --scope picks another by name/path, --ref by root-commit SHA.
+gogol delve processOrder --scope backend     # a symbol in another repo by name
+gogol links handleEvent --ref <root-sha>      # portable SHA identity (no shared fs)
+gogol metrics --scope ~/projects/other        # rank another repo by path
+gogol remember "Note about auth flow"
+gogol forget <id>
+gogol remember "Revised note" --consolidate <id>
+
+# message broker (gogol serve). Isolate with a throwaway GOGOL_HOME; never near prod.
+gogol serve --host 127.0.0.1 --port 7777        # broker + live dashboard at http://127.0.0.1:7777/
+# message tools over POST /mcp: send / receive / peek / presence (see the bus section above)
 ```
 
 ## Common issues
 
-- **Model not found**: Set `model` in `~/.gogol/config` (in the `[global]` section, or a bare key before the first `[section]`)
+- **Model not found**: set `model` in `~/.gogol/config`, or `GOGOL_MODEL`, or the `~/.gogol/model` symlink.
+- **Degenerate ranking on a non-nomic/bge/e5 model**: its arch isn't in the prefix table — set `query_prefix`/`document_prefix` in `[global]` (see the model card).
 - **Abort trap on encode**: n_ubatch < n_tokens. Check embedder.cpp context params.
-- **Old index not loading**: Schema/format mismatch. Re-index with `gogol index --index <name> --force` (or delete `~/.gogol/indexes/<name>.db` and re-index).
-- **No files found**: Check `~/.gogolignore` patterns. Only `.git` is skipped by default.
-- **Daemon won't start**: Check `~/.gogol/serve.log`. Remove stale `~/.gogol/sock` if exists.
-- **"Daemon already running" but it's not**: Remove `~/.gogol/sock` and `~/.gogol/serve.pid`.
-- **Query returns empty**: Check daemon version matches binary (`gogol serve --stop && gogol serve`).
-- **Linux: daemon exits immediately**: Stale socket from previous crash. Remove `~/.gogol/sock`.
-- **Linux: compile errors**: Ensure `<algorithm>`, `<cstdint>` are included (GCC doesn't pull transitively).
+- **Query returns empty**: Re-index (cache.db rebuilds; no need to delete it).
+  If you must reset, do it in an isolated `GOGOL_HOME` — never `rm` the prod
+  `~/.gogol/cache.db` (see the prod-data rule above).
+- **Linux compile errors**: Ensure `<algorithm>`, `<cstdint>` are included (GCC doesn't pull transitively).
 
-## Known limitations & future improvements
+## Known limitations
 
-### Architecture
-- **Handler-thread cancellation granularity**: connection handlers are tracked in a registry and joined on shutdown; `shutdown(SHUT_RDWR)` on each still-running client fd unblocks a stuck `read()` so joins complete. Cancellation is fd-level (close the socket), not cooperative — a handler wedged in CPU work rather than a socket read would still delay shutdown until it returns. Fine in practice since handlers are short (snapshot read or a queue submit).
-- **Daemon auto-restart on version mismatch**: Currently the client prints restart instructions and exits. Should auto-kill + restart the daemon transparently. Related: when no daemon is running, read/write commands just fail with a message — they could auto-start a daemon (and have it self-exit after an idle period).
-
-### Index format
-- **Orphaned embeddings after rm (RETIRED)**: this only ever affected the removed legacy file layout, where a metadata-only rewrite left the removed entry's `.emb` slot dead until the next full re-index. Runtime writes now go through `SqliteBackend` (rm deletes the row — no orphans), so the concern is dead. `SqliteBackend::save_index_meta_only` rewrites entry metadata inside one transaction while preserving embeddings keyed by `(path, line)`, so there is no orphan slot.
-- **No schema version per index**: When extraction changes (new fields in .imports, .types, etc.), indexes need manual `--force` re-index. Should auto-detect and re-index on daemon startup.
-- **Embeddings loaded eagerly**: `SqliteBackend::load_index()` loads every entry's embedding BLOB from `<name>.db` into memory at startup for cosine search (tens of MB per large index; `ensure_embeddings()` is now just a no-op guard). Could memory-map or use `sqlite-vec` for on-disk vector scan instead.
-
-### Search quality
-- **No re-ranking**: Results are pure cosine + BM25 RRF. A cross-encoder re-ranker on top-20 could improve precision significantly.
-- **No query expansion**: Short queries like "TTL" don't benefit from semantic search. Could expand via glossary entries automatically.
-- **Embedding staleness**: Search returns stale entries (with warning). Could filter them by default and show with `--stale` flag.
-
-### Daemon
-- **No graceful embed queue drain on shutdown**: `EmbedDispatcher` destructor waits for current job but drops queued ones. Pending adds lose their embeddings (content is in .mem, just not searchable until next index).
-
-### CLI
-- **No completion**: Tab completion for index names, scope patterns, and commands would reduce friction.
-- **No `gogol compact`**: No explicit command to `VACUUM` an index DB / reclaim space after large removals (SQLite reuses freed pages, but the file doesn't shrink).
+- **Deleted-file GC**: every resync ends with a purge of sources confirmed absent
+  from disk (fs::exists with error_code — stat errors and out-of-root paths are
+  skipped, never purged). Entries die only when their last entry_sources row is
+  gone; entries_vec rows are deleted explicitly (vec0 has no cascade).
+- **No cross-encoder re-ranking**: Results use the cosine+BM25 weighted blend (A3), not a
+  neural cross-encoder. A cross-encoder second stage would improve precision further but
+  can't run in SQLite (requires model inference); it would be an app-side stage 2.
+- **ANN, not exact**: semantic search uses the sqlite-vec `vec0` KNN index
+  (`entries_vec`/`notes_vec`), so cosine ranking is approximate-nearest-neighbor, not an
+  exact all-pairs scan. (The old eager in-memory matrix load / brute-force cosine was
+  retired; `load_matrix` is now dead code.)

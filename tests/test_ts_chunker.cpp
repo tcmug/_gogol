@@ -1,11 +1,31 @@
+// Tests must run their checks even in a Release (-DNDEBUG) build. Without this,
+// every assert() below is preprocessed away and the suite passes vacuously
+// (the set-but-not-used `found_*` warnings were the symptom). Force asserts active.
+#undef NDEBUG
 #include <cassert>
 #include <cstdio>
 #include <string>
 
 #include "chunking/ts_chunker.h"
+#include "chunking/chunker_iface.h"
+#include <algorithm>
 
 static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { tests_run++; printf("  %s... ", #name); } while(0)
+
+// A chunk heading is the symbol name, often followed by its signature / generics /
+// parent context (e.g. "handlePayment(card: string): boolean", "Svc.charge(...)").
+// So tests match by NAME: heading == name, or name immediately followed by a
+// non-identifier char (so "process" matches "process(x)" but NOT "processItems").
+static bool heading_is(const std::string &heading, const std::string &name) {
+    if (heading == name) return true;
+    if (heading.size() <= name.size()) return false;
+    if (heading.compare(0, name.size(), name) != 0) return false;
+    char n = heading[name.size()];
+    bool ident = (n >= 'a' && n <= 'z') || (n >= 'A' && n <= 'Z') ||
+                 (n >= '0' && n <= '9') || n == '_';
+    return !ident;  // next char ends the identifier => this heading IS `name`
+}
 #define PASS() do { tests_passed++; printf("ok\n"); } while(0)
 
 void test_has_grammar() {
@@ -19,6 +39,8 @@ void test_has_grammar() {
     assert(has_treesitter_grammar(".cpp"));
     assert(has_treesitter_grammar(".cc"));
     assert(has_treesitter_grammar(".h"));
+    assert(has_treesitter_grammar(".php"));
+    assert(has_treesitter_grammar(".gd"));
     assert(!has_treesitter_grammar(".md"));
     assert(!has_treesitter_grammar(".txt"));
     assert(!has_treesitter_grammar(".json"));
@@ -53,8 +75,8 @@ export class PaymentService {
     // Should find handlePayment and PaymentService
     bool found_func = false, found_class = false;
     for (auto& c : chunks) {
-        if (c.heading == "handlePayment") found_func = true;
-        if (c.heading == "PaymentService") found_class = true;
+        if (heading_is(c.heading, "handlePayment")) found_func = true;
+        if (heading_is(c.heading, "PaymentService")) found_class = true;
     }
     assert(found_func);
     assert(found_class);
@@ -85,8 +107,8 @@ class Store:
     assert(chunks.size() >= 2);
     bool found_func = false, found_class = false;
     for (auto& c : chunks) {
-        if (c.heading == "process") found_func = true;
-        if (c.heading == "Store") found_class = true;
+        if (heading_is(c.heading, "process")) found_func = true;
+        if (heading_is(c.heading, "Store")) found_class = true;
     }
     assert(found_func);
     assert(found_class);
@@ -111,6 +133,8 @@ func processItems(items []string) int {
 type DataStore struct {
     path string
     data map[string]string
+    dirty bool
+    count int
 }
 
 func NewDataStore(path string) *DataStore {
@@ -124,11 +148,48 @@ func NewDataStore(path string) *DataStore {
     assert(chunks.size() >= 2);
     bool found_func = false, found_type = false;
     for (auto& c : chunks) {
-        if (c.heading == "processItems") found_func = true;
-        if (c.heading == "DataStore") found_type = true;
+        if (heading_is(c.heading, "processItems")) found_func = true;
+        if (heading_is(c.heading, "DataStore")) found_type = true;
     }
     assert(found_func);
     assert(found_type);
+    PASS();
+}
+
+void test_gdscript_chunking() {
+    TEST(gdscript_chunking);
+    std::string code = R"(
+extends Node
+
+func process_data(value: int, name: String) -> bool:
+    if value > 0:
+        print("Positive: ", name)
+        return true
+    elif value < 0:
+        print("Negative: ", name)
+        return false
+    else:
+        print("Zero: ", name)
+        return false
+
+class MyNode extends Node2D:
+    var speed: float = 10.0
+    
+    func _ready():
+        pass
+    
+    func move():
+        position.x += speed
+)";
+    auto chunks = chunk_treesitter(code, ".gd");
+    assert(chunks.size() >= 2);
+    bool found_func = false, found_class = false;
+    for (auto& c : chunks) {
+        if (heading_is(c.heading, "process_data")) found_func = true;
+        if (heading_is(c.heading, "MyNode")) found_class = true;
+    }
+    assert(found_func);
+    assert(found_class);
     PASS();
 }
 
@@ -154,11 +215,10 @@ export function bigFunction(): void {
 }
 )";
     auto chunks = chunk_treesitter(code, ".ts");
-    // Imports should be merged, bigFunction is its own chunk
-    bool found_imports = false, found_func = false;
+    // Imports are merged into `pending` and discarded; bigFunction is its own chunk.
+    bool found_func = false;
     for (auto& c : chunks) {
-        if (c.heading == "imports") found_imports = true;
-        if (c.heading == "bigFunction") found_func = true;
+        if (heading_is(c.heading, "bigFunction")) found_func = true;
     }
     assert(found_func);
     PASS();
@@ -284,18 +344,44 @@ func main() {
     PASS();
 }
 
+// Default index extension set (configless indexing): must be derived from the
+// chunkers gogol actually has — every tree-sitter grammar extension plus the
+// built-in regex-chunker doc formats, and it must NOT include arbitrary types.
+void test_default_index_extensions() {
+    TEST(default_index_extensions);
+    auto exts = default_index_extensions();
+    auto has = [&](const std::string &e) {
+        return std::find(exts.begin(), exts.end(), e) != exts.end();
+    };
+    // every tree-sitter grammar ext is present (single-source: has_treesitter_grammar)
+    assert(has(".ts") && has(".tsx") && has(".py") && has(".go") && has(".rs"));
+    assert(has(".c") && has(".cpp") && has(".cc") && has(".h") && has(".hpp") && has(".php") && has(".gd"));
+    // built-in regex-chunker doc formats present
+    assert(has(".md") && has(".graphql") && has(".yaml") && has(".yml") && has(".sql") && has(".rst"));
+    // NOT a catch-all: unrelated types are absent (WindowChunker not enumerated)
+    assert(!has(".txt") && !has(".png") && !has(".exe"));
+    // consistency: every code ext (not a doc format) is a real tree-sitter grammar
+    for (const auto &e : exts)
+        if (e != ".md" && e != ".mdx" && e != ".graphql" && e != ".gql" &&
+            e != ".yml" && e != ".yaml" && e != ".sql" && e != ".rst")
+            assert(has_treesitter_grammar(e));
+    PASS();
+}
+
 int main() {
     printf("Running tree-sitter chunker tests...\n\n");
     test_has_grammar();
     test_typescript_chunking();
     test_python_chunking();
     test_go_chunking();
+    test_gdscript_chunking();
     test_fallback_on_unknown_ext();
     test_small_nodes_merged();
     test_extract_calls_typescript();
     test_extract_calls_cpp();
     test_extract_calls_python();
     test_extract_calls_go();
+    test_default_index_extensions();
     printf("\n%d/%d tests passed.\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

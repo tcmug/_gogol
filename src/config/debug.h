@@ -11,6 +11,3 @@
   #define DBG_WARN(fmt, ...) ((void)0)
   #define DBG_ERR(fmt, ...) fprintf(stderr, "[ERR] " fmt "\n", ##__VA_ARGS__)
 #endif
-
-// Always-on warnings for data corruption (lightweight, no #ifdef)
-#define WARN_CORRUPT(fmt, ...) fprintf(stderr, "[CORRUPT] " fmt "\n", ##__VA_ARGS__)
